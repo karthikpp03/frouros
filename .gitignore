@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual env
+venv/
+.env/
+
+# Colab
+.ipynb_checkpoints/
+
+# AI model cache
+.cache/
+huggingface/
+*.safetensors
+*.bin
+
+# Events and outputs
+events/
+smart_frames/
+person_crops/
+debug_rejected/
+
+# Memory files
+event_memory.json
+reid_gallery.json
+
+# Logs
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Secrets
+.env
+
+
