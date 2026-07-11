@@ -50,11 +50,15 @@ def generate_event_summary(smart_frame_paths, event_id):
                              image filename.
 
     Returns:
-        (summary, provider, face_status, structured) tuple:
+        (summary, provider, face_result, structured) tuple:
           summary:     str  — the plain-text CCTV summary.
           provider:    str  — "qwen" | "openai" | "none".
-          face_status: str | None — "known" / "unknown" if face
-                       recognition ran for this event, else None.
+          face_result: dict | None — {"name": str, "confidence": float}
+                       if face recognition ran for this event (see
+                       face/recognizer.py), else None. "name" is the
+                       real recognized identity (e.g. "Dad") or the
+                       literal string "Unknown" — never a generic
+                       placeholder.
           structured:  dict | None — rich structured data shaped to
                        match the SQLite schema (see
                        models/openai_vl.py._OPENAI_PROMPT), only
@@ -93,35 +97,41 @@ def generate_event_summary(smart_frame_paths, event_id):
         return summary, "openai", None, structured
 
     # Full routing: known faces stay on free local Qwen, only unknown
-    # faces ever consume OpenAI tokens.
+    # faces ever consume OpenAI tokens. The router decides Qwen vs
+    # OpenAI from the recognized name — face/recognizer.py itself never
+    # makes that decision, it only reports who it saw.
     from face.recognizer import recognize_face
-    face_status = recognize_face(smart_frame_paths)
-    known = face_status == "known"
+    person_name, confidence = recognize_face(smart_frame_paths)
+    known       = person_name != "Unknown"
+    face_result = {"name": person_name, "confidence": confidence}
 
     log_block(
         "ROUTER",
         f"USE_OPENAI = {USE_OPENAI}",
         f"ENABLE_FACE_RECOGNITION = {ENABLE_FACE_RECOGNITION}",
-        f"Known Person = {known}",
+        f"Recognized Person = {person_name} ({confidence:.1f}%)",
         "Selected Pipeline",
         "Qwen2.5-VL" if known else "OpenAI Vision",
     )
 
     if known:
-        return _run_qwen(smart_frame_paths), "qwen", face_status, None
+        return _run_qwen(smart_frame_paths, person_name=person_name), "qwen", face_result, None
 
     summary, structured = _run_openai(smart_frame_paths, event_id)
-    return summary, "openai", face_status, structured
+    return summary, "openai", face_result, structured
 
 
-def _run_qwen(smart_frame_paths):
+def _run_qwen(smart_frame_paths, person_name=None):
     """Local, free, unlimited. Reuses the existing Qwen summary pipeline
-    verbatim — nothing about Qwen's behaviour changes."""
+    verbatim — nothing about Qwen's behaviour changes, except that a
+    recognized person's real name (person_name) is now forwarded into
+    the prompt so Qwen names them explicitly instead of saying
+    "the person" / "a person" / "someone" (see prompts/summary_prompts.py)."""
     from pipelines.summary_pipeline import generate_summary
     from config.settings import QWEN_MODEL_ID
 
     log_block("QWEN", "Generating summary...", f"Model : {QWEN_MODEL_ID}", "Waiting for response...")
-    summary = generate_summary(smart_frame_paths)
+    summary = generate_summary(smart_frame_paths, person_name=person_name)
     log_block("QWEN", "Summary generated.")
     return summary
 

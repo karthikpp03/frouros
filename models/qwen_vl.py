@@ -33,6 +33,7 @@ from transformers import (
     AutoProcessor,
 )
 from config.settings import QWEN_MODEL_ID, BNB_CONFIG
+from utils.device import DEVICE, log_gpu_memory, empty_cache
 
 # Module-level singletons — populated by load_qwen(), cleared by
 # unload_qwen(). Deliberately NOT loaded at import time / startup
@@ -59,15 +60,19 @@ def load_qwen():
 
     print("[INFO] Loading Qwen2.5-VL-3B (4-bit)...")
     print("===================================")
-    print("Before loading Qwen")
-    print(torch.cuda.memory_summary())
+    log_gpu_memory("Before loading Qwen")
     print("===================================")
+
+    load_kwargs = dict(
+        device_map=str(DEVICE),
+        torch_dtype=torch.float16 if DEVICE.type == "cuda" else torch.float32,
+    )
+    if BNB_CONFIG is not None:
+        load_kwargs["quantization_config"] = BNB_CONFIG
 
     qwen_model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
         QWEN_MODEL_ID,
-        quantization_config=BNB_CONFIG,
-        device_map="cuda",
-        torch_dtype=torch.float16,
+        **load_kwargs,
     )
 
     processor = AutoProcessor.from_pretrained(QWEN_MODEL_ID)
@@ -75,8 +80,7 @@ def load_qwen():
 
     print(f"[INFO] Loading {QWEN_MODEL_ID}...")
     print("===================================")
-    print("After loading Qwen")
-    print(torch.cuda.memory_summary())
+    log_gpu_memory("After loading Qwen")
     print("===================================")
 
 
@@ -107,7 +111,7 @@ def unload_qwen():
     # only reachable through them) are actually freed before we ask
     # CUDA's caching allocator to release its now-unused memory pool.
     gc.collect()
-    torch.cuda.empty_cache()
+    empty_cache()
 
     print("[INFO] Qwen2.5-VL-3B unloaded.")
 
@@ -128,7 +132,7 @@ def _qwen_infer(messages, pil_images=None, max_new_tokens=64):
             "on the GPU permanently."
         )
 
-    torch.cuda.empty_cache()
+    empty_cache()
     gc.collect()
 
     text = processor.apply_chat_template(
@@ -146,7 +150,7 @@ def _qwen_infer(messages, pil_images=None, max_new_tokens=64):
     else:
         inputs = processor(text=[text], return_tensors="pt")
 
-    inputs = inputs.to("cuda")
+    inputs = inputs.to(DEVICE)
 
     with torch.no_grad():
         generated_ids = qwen_model.generate(
@@ -165,7 +169,7 @@ def _qwen_infer(messages, pil_images=None, max_new_tokens=64):
     # caller once ALL Qwen calls for this event are done), this keeps
     # peak GPU usage as low as possible during generation.
     del inputs, generated_ids
-    torch.cuda.empty_cache()
+    empty_cache()
     gc.collect()
 
     if "assistant" in output_text:

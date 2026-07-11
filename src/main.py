@@ -99,6 +99,10 @@ from pipelines.query_pipeline import query_memory
 # ── torch perf flag ──────────────────────────────────────────────────────────
 torch.backends.cudnn.benchmark = True
 
+# ── device diagnostics (printed once, at startup) ────────────────────────────
+from utils.device import log_device_info
+log_device_info()
+
 
 # ==============================================================================
 # 1. DATA DIRECTORIES + SEED MEMORY FILE
@@ -141,6 +145,14 @@ _db.insert_camera(Camera(
 
 load_groq()         # Groq / Llama-3.1-8B-instant (cloud API — no local GPU/RAM cost)
 load_reid()         # FastReID → OSNet → ResNet18 fallback chain (CPU-resident)
+
+# Face recognition (InsightFace / ArcFace) — loaded exactly once here,
+# and only when it could actually be used (USE_OPENAI=true AND
+# ENABLE_FACE_RECOGNITION=true, matching services/summary_router.py's
+# own condition). A complete no-op otherwise: InsightFace is never
+# imported, the face database is never read. See face/recognizer.py.
+from face.recognizer import load_face_recognizer
+load_face_recognizer()
 
 # After load_reid() REID_DIM is finalised in config.settings — gallery can now build index
 gallery_load()

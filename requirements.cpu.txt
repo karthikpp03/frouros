@@ -24,4 +24,4 @@ insightface
 # install onnxruntime-gpu instead (do not install both) so
 # CUDAExecutionProvider is available to face/recognizer.py's
 # device-aware provider selection.
-onnxruntime-gpu
+onnxruntime

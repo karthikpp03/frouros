@@ -59,6 +59,19 @@ WHERE event_date BETWEEN :date_from AND :date_to
 ORDER BY event_date DESC, start_time DESC
 """
 
+GET_EVENTS_BY_TIME_RANGE = """
+SELECT * FROM events
+WHERE start_time BETWEEN :start_time AND :end_time
+ORDER BY start_time DESC
+"""
+
+GET_UNKNOWN_VISITOR_EVENTS = """
+SELECT DISTINCT events.* FROM events
+JOIN persons ON persons.event_id = events.event_id
+WHERE persons.known_status = 'unknown' OR persons.known_status IS NULL
+ORDER BY events.event_date DESC, events.start_time DESC
+"""
+
 DELETE_EVENT = "DELETE FROM events WHERE event_id = :event_id"
 
 # search_events() builds its WHERE clause dynamically (optional filters),
@@ -66,6 +79,47 @@ DELETE_EVENT = "DELETE FROM events WHERE event_id = :event_id"
 # still always through parameterized "?"/":name" placeholders, never
 # raw string interpolation of values.
 SEARCH_EVENTS_BASE = "SELECT DISTINCT events.* FROM events"
+
+GET_EVENTS_WITH_VEHICLES = """
+SELECT DISTINCT events.* FROM events
+JOIN vehicles ON vehicles.event_id = events.event_id
+ORDER BY events.event_date DESC, events.start_time DESC
+"""
+
+GET_EVENTS_BY_OBJECT_TYPE = """
+SELECT DISTINCT events.* FROM events
+JOIN objects ON objects.event_id = events.event_id
+WHERE objects.object_type LIKE :pattern
+ORDER BY events.event_date DESC, events.start_time DESC
+"""
+
+GET_EVENTS_BY_KEYWORD_LIKE = """
+SELECT DISTINCT events.* FROM events
+JOIN keywords ON keywords.event_id = events.event_id
+WHERE keywords.keyword LIKE :pattern
+ORDER BY events.event_date DESC, events.start_time DESC
+"""
+
+# Person-aware retrieval (Task 9) — every event that has at least one
+# person row matching the given name, case-insensitively. person_name
+# is always a real stored name ("Dad", "test_1", ...) or the literal
+# "Unknown" — never a placeholder (see services/db_writer.py).
+GET_EVENTS_BY_PERSON_NAME = """
+SELECT DISTINCT events.* FROM events
+JOIN persons ON persons.event_id = events.event_id
+WHERE persons.person_name = :person_name COLLATE NOCASE
+ORDER BY events.event_date DESC, events.start_time DESC
+"""
+
+# Every distinct registered ("known") person name currently in SQLite —
+# used to detect which person (if any) a Telegram question is about,
+# BEFORE any event rows are fetched (see pipelines/query_pipeline.py).
+GET_KNOWN_PERSON_NAMES = """
+SELECT DISTINCT person_name FROM persons
+WHERE known_status = 'known'
+  AND person_name IS NOT NULL
+  AND person_name != 'Unknown'
+"""
 
 # ---------------------------------------------------------------------
 # persons

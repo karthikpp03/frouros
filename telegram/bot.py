@@ -10,6 +10,7 @@ The only structural change: query_memory is imported from
 pipelines/query_pipeline.py instead of being defined inline.
 """
 
+import os
 import time
 import threading
 
@@ -92,7 +93,11 @@ def bot_poll_loop():
                 with bot_lock:
                     bot_chat_history.append(("assistant", answer[:200]))
 
-                tg_send_message(chat_id, answer)
+                sent_ok = tg_send_message(chat_id, answer)
+                if not sent_ok:
+                    print(f"[TELEGRAM] WARNING — reply for question "
+                          f"'{text[:50]}' was NOT confirmed delivered "
+                          f"(see [TELEGRAM] log above for the reason).")
 
                 for i, img_path in enumerate(img_paths):
                     if os.path.exists(img_path):
@@ -101,9 +106,15 @@ def bot_poll_loop():
 
                 log_bar()
 
+            except TimeoutError as e:
+                tg_send_message(chat_id, "Sorry, the request timed out. Please try again.")
+                print(f"[TELEGRAM] Query timeout: {e}")
+            except ConnectionError as e:
+                tg_send_message(chat_id, "Sorry, a network error occurred while answering. Please try again.")
+                print(f"[TELEGRAM] Query network error: {e}")
             except Exception as e:
                 tg_send_message(chat_id, f"Sorry, an error occurred: {e}")
-                print(f"[TELEGRAM] Query error: {e}")
+                print(f"[TELEGRAM] Query error ({type(e).__name__}): {e}")
 
         if len(_processed_updates) > 5000:
             _processed_updates.clear()
@@ -115,12 +126,6 @@ def bot_poll_loop():
 
 def start_bot_thread():
     """Spawn the polling loop in a background daemon thread and return it."""
-    import os  # needed for os.path.exists inside the loop
-    # Patch os into the module's namespace so the closure above can use it
-    import telegram.bot as _self
-    import os as _os
-    _self.os = _os
-
     thread = threading.Thread(
         target=bot_poll_loop, daemon=True, name="TelegramBot"
     )

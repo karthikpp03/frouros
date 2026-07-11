@@ -30,6 +30,7 @@ import numpy as np
 from transformers import VideoMAEModel, VideoMAEImageProcessor
 from config.settings import VIDEOMAE_MODEL, SMART_FRAMES_DIR
 from utils.event_logger import log_block
+from utils.device import empty_cache, log_gpu_memory
 
 # Module-level singletons — populated by load_videomae(), cleared by
 # unload_videomae(). No longer loaded at import time / startup.
@@ -84,13 +85,13 @@ def unload_videomae():
     gc.collect()
     # VideoMAE runs on CPU in this pipeline, so there's normally nothing
     # in the CUDA allocator to reclaim here — but this call is cheap and
-    # harmless, and keeps the "release GPU memory" step in place even if
-    # VideoMAE's device ever changes later.
-    torch.cuda.empty_cache()
+    # harmless (and skipped entirely on CPU-only systems), and keeps the
+    # "release GPU memory" step in place even if VideoMAE's device ever
+    # changes later.
+    empty_cache()
 
     print("[INFO] VideoMAE unloaded.")
-    print("After VideoMAE unload")
-    print(torch.cuda.memory_summary())
+    log_gpu_memory("After VideoMAE unload")
 
 
 def extract_smart_frames(video_path_arg, ev_id):

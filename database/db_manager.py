@@ -147,6 +147,75 @@ class DatabaseManager:
             ).fetchall()
         return [_row_to_event(r) for r in rows]
 
+    def get_events_by_time_range(self, start_time: str, end_time: str) -> List[Event]:
+        """
+        Inclusive range over events.start_time (format matches how it's
+        stored: 'YYYY-MM-DD HH:MM:SS'). Used by the smart-retrieval
+        layer (pipelines/retrieval.py) for "what happened between X
+        and Y" style queries, so only rows in that window are ever
+        pulled back.
+        """
+        with connection_scope(self.db_path) as conn:
+            rows = conn.execute(
+                queries.GET_EVENTS_BY_TIME_RANGE,
+                {"start_time": start_time, "end_time": end_time},
+            ).fetchall()
+        return [_row_to_event(r) for r in rows]
+
+    def get_unknown_visitor_events(self) -> List[Event]:
+        """Events with at least one person whose known_status is
+        'unknown' (or unset) — used for "show unknown visitors"."""
+        with connection_scope(self.db_path) as conn:
+            rows = conn.execute(queries.GET_UNKNOWN_VISITOR_EVENTS).fetchall()
+        return [_row_to_event(r) for r in rows]
+
+    def get_events_with_vehicles(self) -> List[Event]:
+        """Events that have at least one linked vehicle row — used for
+        "did any vehicle show up" style queries."""
+        with connection_scope(self.db_path) as conn:
+            rows = conn.execute(queries.GET_EVENTS_WITH_VEHICLES).fetchall()
+        return [_row_to_event(r) for r in rows]
+
+    def get_events_by_object_type(self, pattern: str) -> List[Event]:
+        """
+        Events with an object whose object_type matches `pattern`
+        (a SQL LIKE pattern, e.g. '%parcel%'). Used for "show people
+        carrying parcels" style queries — only fetches events with a
+        matching object row, never the whole table.
+        """
+        with connection_scope(self.db_path) as conn:
+            rows = conn.execute(
+                queries.GET_EVENTS_BY_OBJECT_TYPE, {"pattern": pattern}
+            ).fetchall()
+        return [_row_to_event(r) for r in rows]
+
+    def get_events_by_keyword_like(self, pattern: str) -> List[Event]:
+        """Events whose keywords table has a fuzzy (LIKE) match for
+        `pattern` (e.g. '%delivery%'). Complements search_events()'s
+        exact keyword match with a looser lookup."""
+        with connection_scope(self.db_path) as conn:
+            rows = conn.execute(
+                queries.GET_EVENTS_BY_KEYWORD_LIKE, {"pattern": pattern}
+            ).fetchall()
+        return [_row_to_event(r) for r in rows]
+
+    def get_events_by_person_name(self, person_name: str) -> List[Event]:
+        """Every event with a person row matching `person_name`
+        (case-insensitive) — e.g. "Dad", "test_1", or "Unknown"."""
+        with connection_scope(self.db_path) as conn:
+            rows = conn.execute(
+                queries.GET_EVENTS_BY_PERSON_NAME, {"person_name": person_name}
+            ).fetchall()
+        return [_row_to_event(r) for r in rows]
+
+    def get_known_person_names(self) -> List[str]:
+        """Every distinct registered ("known") person name currently in
+        SQLite — e.g. ['Dad', 'Mom', 'test_1']. Used to detect which
+        person (if any) a natural-language question is about."""
+        with connection_scope(self.db_path) as conn:
+            rows = conn.execute(queries.GET_KNOWN_PERSON_NAMES).fetchall()
+        return [r["person_name"] for r in rows]
+
     def search_events(
         self,
         keyword: Optional[str] = None,

@@ -116,16 +116,29 @@ STRICT GROUNDING RULES:
 - Never hallucinate a person, object, or vehicle that is not visible.
 - Do not mention "Frame 1/2/3" or the image layout in the summary text.
 
+IDENTITY RULE (read carefully):
+- This image is ONLY ever sent to you for a person who is NOT a
+  registered/recognized face — every person you see here is, by
+  definition, unidentified.
+- In the "summary" text, always refer to any person you describe as
+  "Unknown person" (e.g. "Unknown person entered the house.",
+  "Unknown person carrying a parcel."). NEVER use "a person", "the
+  person", "someone", "individual", or a bare pronoun as the subject —
+  always use the exact phrase "Unknown person".
+- In the "persons" array, set "person_name" to the exact literal string
+  "Unknown" for every person object (never null, never a guessed name).
+
 Return ONLY a single JSON object (no markdown, no code fences, no
 commentary) with EXACTLY this shape:
 
 {{
-  "summary": "<natural, flowing CCTV incident report paragraph>",
+  "summary": "<natural, flowing CCTV incident report paragraph, referring to any person as 'Unknown person'>",
   "event_type": "<short label, e.g. 'person_detected', 'delivery', 'loitering'>",
   "confidence": <float 0.0-1.0, your overall confidence in this analysis>,
   "persons": [
     {{
       "known_status": "unknown",
+      "person_name": "Unknown",
       "gender": "...", "estimated_age": "...", "height": "...",
       "body_build": "...", "top_clothing": "...", "bottom_clothing": "...",
       "footwear": "...", "headwear": "...", "hair": "...", "beard": "...",
@@ -188,22 +201,45 @@ def generate_openai_analysis(merged_image_path):
     Returns:
         dict — see _OPENAI_PROMPT / _fallback_result() above for the
         exact shape. Always contains at least "summary".
+
+    Raises:
+        RuntimeError — with a clear, tagged message identifying whether
+        the failure was an OpenAI API error, a network/connection
+        error, or a timeout. Never hides the original exception (it is
+        always chained via `from e`), so pipelines/event_manager.py's
+        caller sees exactly what went wrong instead of a generic crash.
     """
+    from openai import (
+        APIConnectionError,
+        APITimeoutError,
+        APIStatusError,
+        OpenAIError,
+    )
+
     client = _get_client()
     data_url = _image_to_data_url(merged_image_path)
 
-    response = client.chat.completions.create(
-        model=OPENAI_MODEL,
-        messages=[{
-            "role": "user",
-            "content": [
-                {"type": "text", "text": _OPENAI_PROMPT},
-                {"type": "image_url", "image_url": {"url": data_url}},
-            ],
-        }],
-        max_tokens=1200,
-        response_format={"type": "json_object"},
-    )
+    try:
+        response = client.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=[{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": _OPENAI_PROMPT},
+                    {"type": "image_url", "image_url": {"url": data_url}},
+                ],
+            }],
+            max_tokens=1200,
+            response_format={"type": "json_object"},
+        )
+    except APITimeoutError as e:
+        raise RuntimeError(f"[OPENAI] Request timed out: {e}") from e
+    except APIConnectionError as e:
+        raise RuntimeError(f"[OPENAI] Network/connection error: {e}") from e
+    except APIStatusError as e:
+        raise RuntimeError(f"[OPENAI] API error (status {e.status_code}): {e}") from e
+    except OpenAIError as e:
+        raise RuntimeError(f"[OPENAI] API error: {e}") from e
 
     raw = (response.choices[0].message.content or "").strip()
 

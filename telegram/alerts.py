@@ -19,13 +19,75 @@ from config.settings import BOT_TOKEN, CHAT_ID, BASE_URL
 # LOW-LEVEL TELEGRAM HELPERS  (unchanged)
 # --------------------------------------------------
 
-def tg_send_message(chat_id, text):
+def tg_send_message(chat_id, text, _retry_plain=True):
+    """
+    Send a Telegram text message and verify it actually went through.
+
+    Previously this only caught request-level exceptions (network
+    errors) — it never inspected Telegram's own JSON response. Telegram
+    returns HTTP 200 with `{"ok": false, ...}` for perfectly ordinary
+    failures (e.g. a Groq-generated answer containing unmatched
+    '*'/'_' characters breaks `parse_mode: "Markdown"` parsing), so a
+    reply could silently fail to reach the user with no error ever
+    printed — this is the bug behind "Groq answered but Telegram never
+    received it".
+
+    Now:
+      1. The response is always parsed and checked (`ok` field).
+      2. If Markdown parsing is what failed, the same text is retried
+         once as plain text (no parse_mode) rather than being dropped.
+      3. Success or failure is always logged.
+
+    Returns:
+        bool — True if the message was confirmed delivered, False
+        otherwise (already logged).
+    """
     url  = f"{BASE_URL}/sendMessage"
     data = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
+
+    print("[TELEGRAM] Sending reply...")
     try:
-        requests.post(url, data=data, timeout=10)
+        resp = requests.post(url, data=data, timeout=10)
     except Exception as e:
-        print(f"[TELEGRAM] Message error: {e}")
+        print(f"[TELEGRAM] Failed to send reply: {e}")
+        return False
+
+    try:
+        result = resp.json()
+    except ValueError as e:
+        print(f"[TELEGRAM] Failed to send reply: could not parse Telegram "
+              f"response ({e}); HTTP {resp.status_code}: {resp.text[:200]}")
+        return False
+
+    if result.get("ok"):
+        print("[TELEGRAM] Reply sent successfully.")
+        return True
+
+    description = result.get("description", "unknown error")
+
+    # Markdown parse failures are the single most common cause of a
+    # silently-dropped reply, since the message text usually comes
+    # straight from an LLM (Groq) and can easily contain unmatched
+    # '*'/'_'/'`' characters. Retry once as plain text rather than
+    # losing the answer entirely.
+    if _retry_plain and "can't parse entities" in description.lower():
+        print(f"[TELEGRAM] Markdown parse error ({description}) — "
+              f"retrying as plain text...")
+        plain_data = {"chat_id": chat_id, "text": text}
+        try:
+            resp2 = requests.post(url, data=plain_data, timeout=10)
+            result2 = resp2.json()
+        except Exception as e:
+            print(f"[TELEGRAM] Failed to send reply: {e}")
+            return False
+        if result2.get("ok"):
+            print("[TELEGRAM] Reply sent successfully (plain text fallback).")
+            return True
+        print(f"[TELEGRAM] Failed to send reply: {result2.get('description', 'unknown error')}")
+        return False
+
+    print(f"[TELEGRAM] Failed to send reply: {description}")
+    return False
 
 
 def tg_send_photo(chat_id, image_path, caption=""):

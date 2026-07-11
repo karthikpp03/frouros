@@ -87,11 +87,29 @@ def connection_scope(db_path: str = DB_PATH) -> Iterator[sqlite3.Connection]:
 
         with connection_scope() as conn:
             conn.execute(...)
+
+    SQLite errors are re-raised with a clear "[SQLITE]"-tagged message
+    identifying the failure (integrity/constraint violation vs a
+    general operational error) so callers can tell a bad-data problem
+    apart from a locked-database / disk-I/O problem at a glance.
+    Nothing here hides the original exception — it is always chained
+    via `from e`.
     """
     conn = get_connection(db_path)
     try:
         yield conn
         conn.commit()
+    except sqlite3.IntegrityError as e:
+        conn.rollback()
+        raise sqlite3.IntegrityError(
+            f"[SQLITE] Integrity/constraint violation (rolled back): {e}"
+        ) from e
+    except sqlite3.OperationalError as e:
+        conn.rollback()
+        raise sqlite3.OperationalError(
+            f"[SQLITE] Operational error — e.g. locked database or bad SQL "
+            f"(rolled back): {e}"
+        ) from e
     except Exception:
         conn.rollback()
         raise

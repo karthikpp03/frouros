@@ -2,7 +2,7 @@ services:
   frouros:
     build:
       context: .
-      dockerfile: Dockerfile
+      dockerfile: Dockerfile.cpu
 
     container_name: frouros-ai
 

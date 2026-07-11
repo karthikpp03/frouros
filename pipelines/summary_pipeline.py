@@ -23,15 +23,23 @@ from prompts.summary_prompts import (
 )
 
 
-def generate_summary(frame_paths):
+def generate_summary(frame_paths, person_name=None):
     """
     Given a list of frame image paths (from VideoMAE), produce a natural
     CCTV event summary using Qwen2.5-VL-7B.
-    Identical to the original generate_summary().
+
+    Args:
+        frame_paths: unchanged.
+        person_name: str | None — the recognized identity from
+                      face/recognizer.py, forwarded to
+                      prompts.summary_prompts.build_summary_messages() so
+                      Qwen names the individual explicitly instead of
+                      using a generic term. None preserves the original
+                      (pre-face-recognition) behaviour exactly.
     """
     print("[INFO] Generating AI summary (Qwen2.5-VL-7B)...")
     pil_images = [Image.open(fp) for fp in frame_paths]
-    messages   = build_summary_messages(pil_images)
+    messages   = build_summary_messages(pil_images, person_name=person_name)
     return _qwen_infer(messages, pil_images=pil_images, max_new_tokens=250)
 
 

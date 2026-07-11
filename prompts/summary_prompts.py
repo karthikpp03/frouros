@@ -7,12 +7,25 @@ Functions return fully-formed message dicts ready for _qwen_infer().
 
 from prompts.grounding_rules import _GROUNDING_RULES
 
-def build_summary_messages(pil_images):
+def build_summary_messages(pil_images, person_name=None):
     """
     Returns the messages list passed to _qwen_infer() for event summarisation.
     Images are interleaved with explicit stage labels (Beginning/Middle/End)
     so the model treats them as one temporal sequence instead of three
     independent images.
+
+    Args:
+        pil_images:  the 3 chronological smart frames (unchanged).
+        person_name: str | None — the real, recognized identity from
+                      face/recognizer.py (e.g. "Dad", "test_1") if this
+                      event was routed to Qwen because a registered face
+                      was recognized. When provided, Qwen is explicitly
+                      told to refer to the individual by this name
+                      throughout the summary instead of a generic term
+                      ("the person", "a person", "someone", "individual").
+                      None when face recognition is disabled/unavailable
+                      for this event — behaviour is then identical to
+                      before this parameter existed.
     """
     stage_labels = ["BEGINNING of the event", "MIDDLE of the event", "END of the event"]
 
@@ -22,10 +35,23 @@ def build_summary_messages(pil_images):
         content.append({"type": "text", "text": f"--- Frame {i+1} ({label}) ---"})
         content.append({"type": "image", "image": img})
 
+    identity_instruction = ""
+    if person_name:
+        identity_instruction = (
+            f"IDENTITY: The person in these frames has been positively "
+            f"identified by the face-recognition system as \"{person_name}\". "
+            f"You MUST refer to them by this exact name (\"{person_name}\") "
+            f"everywhere in the summary — e.g. \"{person_name} entered the "
+            f"house\", \"{person_name} walked toward the door\". Do NOT refer "
+            f"to them as \"the person\", \"a person\", \"someone\", "
+            f"\"individual\", or \"known person\" anywhere in the summary.\n\n"
+        )
+
     content.append({
         "type": "text",
         "text": (
             f"{_GROUNDING_RULES}\n\n"
+            f"{identity_instruction}"
             "The 3 images above are consecutive frames from ONE SINGLE CCTV event, "
             "in strict chronological order: Frame 1 = beginning, Frame 2 = middle, "
             "Frame 3 = end.\n\n"

@@ -104,6 +104,7 @@ from models.qwen_vl             import load_qwen, unload_qwen
 from pipelines.summary_pipeline import extract_person_attributes
 from telegram.alerts            import send_telegram_alert, tg_send_message
 from utils.event_logger         import log_event_header, log_block, log_completion
+from utils.device               import empty_cache
 
 # Single routing decision point for "Qwen vs OpenAI" — see
 # services/summary_router.py. event_manager never decides the provider
@@ -455,7 +456,7 @@ class EventManager:
         # (maybe) load Qwen next, and clear CUDA's cache so Qwen gets
         # the largest possible contiguous block of free GPU memory.
         gc.collect()
-        torch.cuda.empty_cache()
+        empty_cache()
 
         # STEP 4: summary — provider (Qwen vs OpenAI) decided ENTIRELY
         # by services/summary_router.py, based on USE_OPENAI /
@@ -476,14 +477,49 @@ class EventManager:
         if qwen_may_run:
             load_qwen()
         try:
-            summary, provider, face_status, structured = generate_event_summary(smart_frames, ev_id)
-            header = f"{provider.upper()} SUMMARY" + (f" (face: {face_status})" if face_status else "")
+            summary, provider, face_result, structured = generate_event_summary(smart_frames, ev_id)
+            header = f"{provider.upper()} SUMMARY" + (
+                f" (person: {face_result['name']}, {face_result['confidence']:.1f}%)"
+                if face_result else ""
+            )
             print("\n" + "=" * 50 + f"\n{header}\n" + "=" * 50)
             print(summary)
 
-            # STEP 5: full summary message
+            # Single source of truth for the recognized identity of this
+            # event — computed exactly once, right here, and reused both
+            # for the Telegram full-report header below AND for the
+            # structured/SQLite persist step further down (STEP 9), so
+            # the recognized name can never drift or be recomputed
+            # differently in two places.
+            #   recognized_name/confidence : the real name (e.g. "Dad")
+            #                                 if a registered face was
+            #                                 matched — else None.
+            #   person_label                : Telegram-facing prefix —
+            #                                 "✅ <name>" for a known
+            #                                 match, "⚠ Unknown person"
+            #                                 if face recognition ran
+            #                                 but found no match, or
+            #                                 None if face recognition
+            #                                 never ran for this event.
+            recognized_name = None
+            recognized_conf = None
+            if face_result and face_result.get("name") not in (None, "Unknown"):
+                recognized_name = face_result["name"]
+                recognized_conf = face_result.get("confidence")
+                person_label = f"✅ {recognized_name}"
+            elif face_result:
+                person_label = "⚠ Unknown person"
+            else:
+                person_label = None
+
+            # STEP 5: full summary message — always uses the stored
+            # person_name (never a generic placeholder) when face
+            # recognition ran for this event.
             if write_ok:
-                tg_send_message(CHAT_ID, f"📋 *Event #{ev_id} Full Report*\n\n{summary[:1000]}")
+                header_line = f"📋 *Event #{ev_id} Full Report*"
+                if person_label:
+                    header_line += f"\n{person_label}"
+                tg_send_message(CHAT_ID, f"{header_line}\n\n{summary[:1000]}")
 
             # STEP 6: save this event's own best crop (no shared dict needed
             # since best_crop already belongs to only this event)
@@ -556,7 +592,20 @@ class EventManager:
             # from the attribute-extraction output we already have, so
             # every event is queryable from SQLite regardless of which
             # provider generated it. No extra AI calls are made here.
-            structured = build_structured_from_qwen(summary, persons_attrs)
+            #
+            # If face recognition routed this event to Qwen because it
+            # recognized a registered person, the real recognized name
+            # (never a placeholder like "Known Person") is stored on
+            # the person record — see services/db_writer.py.
+            # recognized_name / recognized_conf were already computed
+            # once, right after the router returned above — reused here
+            # as-is so the name can never drift between the Telegram
+            # alert and what gets persisted to SQLite.
+            structured = build_structured_from_qwen(
+                summary, persons_attrs,
+                person_name=recognized_name,
+                confidence=recognized_conf,
+            )
             merged_image_path = None
 
         db_ok = persist_event(

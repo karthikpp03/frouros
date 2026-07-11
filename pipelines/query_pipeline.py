@@ -14,7 +14,7 @@ Intent patterns and the Llama system prompt live in prompts/query_prompts.py.
 
 import os
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from config.settings import REID_SIMILARITY_THRESHOLD
 from memory.event_memory import load_memory
@@ -34,10 +34,14 @@ from prompts.query_prompts import LLAMA_SYSTEM_PROMPT, INTENT_PATTERNS
 # + the FAISS ReID index for photo lookups — that is a pre-existing,
 # working feature unrelated to this integration (crop-image retrieval,
 # not summary generation) and is left untouched.
-from database.db_manager import DatabaseManager
+#
+# All SQLite reads go through pipelines/retrieval.py's named helper
+# functions (get_event_by_id, get_events_by_date, get_unknown_visitors,
+# get_delivery_events, get_vehicle_events, get_parcel_events,
+# get_keyword_matches, ...) — this module never opens a DatabaseManager
+# or runs SQL directly, and neither does telegram/bot.py.
+from pipelines import retrieval
 from utils.event_logger import log_block
-
-_db = DatabaseManager()
 
 # Objects worth trying as a `keywords` table lookup before falling back
 # to "give me every recent event" — keeps Telegram/Groq's SQLite reads
@@ -65,6 +69,35 @@ def classify_intent(query):
                 matched.append(intent)
                 break
     return matched or ["general"]
+
+
+# --------------------------------------------------
+# PERSON NAME DETECTION  (Task 9 — person-aware retrieval)
+# --------------------------------------------------
+
+def _detect_person_name(query):
+    """
+    Detect a registered person's name mentioned in the operator's
+    question (e.g. "Dad", "test_1"), matched as a whole word,
+    case-insensitively, against every name currently registered in
+    SQLite (pipelines.retrieval.get_known_person_names() — populated
+    from face/face_db.py registrations, never a placeholder).
+
+    Returns:
+        str | None — the exact stored name (correct casing) if found,
+        else None. "Unknown" is intentionally not matched here — "show
+        unknown visitors" style questions are already handled by the
+        existing get_unknown_visitors() branch below.
+    """
+    names = retrieval.get_known_person_names()
+    if not names:
+        return None
+
+    q = query.lower()
+    for name in names:
+        if re.search(rf"\b{re.escape(name.lower())}\b", q):
+            return name
+    return None
 
 
 # --------------------------------------------------
@@ -148,36 +181,100 @@ def build_structured_context(memory, query, intents):
 def _relevant_events_from_db(query, intents):
     """
     Python-side retrieval step in the Telegram flow:
-        Groq (intent) -> Python retrieves ONLY relevant records from
-        SQLite -> Groq (answer).
+        Groq (intent) -> Python retrieves ONLY relevant records via
+        pipelines/retrieval.py's named helpers -> Groq (answer).
 
-    Tries a narrow keyword-table lookup first (cheap, precise); falls
-    back to the most recent events (still capped) so a question with
-    no exact keyword match still gets an answer. Never fetches the
-    whole database.
+    Dispatches to the narrowest matching helper — a specific event id,
+    a date, a category (unknown visitors / delivery / vehicle /
+    parcel), or a named keyword — before ever falling back to "most
+    recent events". Never fetches the whole database, and never opens
+    a DatabaseManager or runs SQL directly (that only happens inside
+    pipelines/retrieval.py).
 
     Returns: list[database.models.Event]
     """
     q = query.lower()
 
-    # 1) Try a keyword-table hit for any object explicitly named in the
-    #    question — this is the "only delivery events" / "who carried a
-    #    parcel" style narrow lookup from the integration spec.
+    # 0) Person-aware retrieval — the MOST specific possible filter,
+    # checked before every other category below. If the question names
+    # a registered person (e.g. "Dad", "test_1"), every subsequent
+    # lookup is narrowed to ONLY that person's events — other people's
+    # events (Mom, Unknown, Priya, ...) are never retrieved, and Groq
+    # never sees them. See _detect_person_name() above and
+    # pipelines/retrieval.py's get_events_by_person* helpers.
+    person_name = _detect_person_name(query)
+    if person_name:
+        if "yesterday" in q:
+            yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+            hits = retrieval.get_events_by_person_and_date(person_name, yesterday)
+            if hits:
+                return hits
+
+        for kw in _KNOWN_OBJECT_KEYWORDS:
+            if kw in q:
+                hits = retrieval.get_events_by_person_and_keyword(person_name, kw)
+                if hits:
+                    return hits
+
+        hits = retrieval.get_events_by_person(person_name)
+        if hits:
+            return hits[:_MAX_EVENTS_PER_QUERY]
+
+        # A registered person was named but has zero events on record —
+        # return empty rather than silently falling through to another
+        # person's events (e.g. "most recent events" below).
+        return []
+
+    # 1) A specific event id — "explain event 5", "what happened in
+    #    event #12" — is the narrowest possible retrieval.
+    m = re.search(r"event\s*#?\s*(\d+)", q)
+    if m:
+        event = retrieval.get_event_by_id(m.group(1))
+        if event:
+            return [event]
+
+    # 2) Category-specific helpers, tried in order of specificity.
+    if "unknown" in q and ("visitor" in q or "person" in q or "people" in q):
+        hits = retrieval.get_unknown_visitors()
+        if hits:
+            return hits
+
+    if any(w in q for w in ("delivery", "courier", "postman")):
+        hits = retrieval.get_delivery_events()
+        if hits:
+            return hits
+
+    if "parcel" in q or "package" in q:
+        hits = retrieval.get_parcel_events()
+        if hits:
+            return hits
+
+    if any(w in q for w in ("vehicle", "car", "bike", "motorcycle", "van", "truck")):
+        hits = retrieval.get_vehicle_events()
+        if hits:
+            return hits
+
+    # 3) Named-object keyword lookup — "who carried a bag / phone / ..."
     for kw in _KNOWN_OBJECT_KEYWORDS:
         if kw in q:
-            hits = _db.search_events(keyword=kw)
+            hits = retrieval.get_keyword_matches(kw)
             if hits:
                 return hits[:_MAX_EVENTS_PER_QUERY]
 
-    # 2) time_query intent — pull everything in range and let the
+    # 4) "yesterday" — the single most common relative-date question.
+    if "yesterday" in q:
+        hits = retrieval.get_yesterdays_events()
+        if hits:
+            return hits
+
+    # 5) time_query intent — pull everything in range and let the
     #    existing hour-of-day filter (below, in build_structured_context)
     #    narrow it further; SQLite only helps us cap volume here.
     #    (No explicit date parsing beyond hour-of-day is attempted, to
     #    keep behaviour identical to the pre-Phase-2 JSON-memory path.)
 
-    # 3) Fallback — most recent events, still capped, never the full table.
-    events = _db.search_events()
-    return events[:_MAX_EVENTS_PER_QUERY]
+    # 6) Fallback — most recent events, still capped, never the full table.
+    return retrieval.get_recent_events(_MAX_EVENTS_PER_QUERY)
 
 
 def build_structured_context_from_db(events, query, intents):
@@ -205,29 +302,32 @@ def build_structured_context_from_db(events, query, intents):
             f"Summary: {event.summary}\n"
         )
 
-        for p in _db.get_persons_by_event(event.event_id):
+        details = retrieval.get_event_details(event.event_id)
+
+        for p in details["persons"]:
             s += (
-                f"  Person [{p.known_status or 'unknown'}]: "
+                f"  Person [{p.known_status or 'unknown'}]"
+                f"{' — ' + p.person_name if p.person_name else ''}: "
                 f"gender={p.gender}, age={p.estimated_age}, "
                 f"top={p.top_clothing}, bottom={p.bottom_clothing}, "
                 f"bag={p.bag}, headwear={p.headwear}\n"
             )
 
-        for m in _db.get_movement_by_event(event.event_id):
+        for m in details["movement"]:
             s += (
                 f"  Movement: entry={m.entry_point}, exit={m.exit_point}, "
                 f"direction={m.direction}, loitering={bool(m.loitering)}\n"
             )
 
-        acts = _db.get_actions_by_event(event.event_id)
+        acts = details["actions"]
         if acts:
             s += "  Actions: " + ", ".join(a.action for a in acts) + "\n"
 
-        objs = _db.get_objects_by_event(event.event_id)
+        objs = details["objects"]
         if objs:
             s += "  Objects: " + ", ".join(o.object_type for o in objs) + "\n"
 
-        vehicles = _db.get_vehicles_by_event(event.event_id)
+        vehicles = details["vehicles"]
         if vehicles:
             s += "  Vehicles: " + ", ".join(
                 f"{v.color or ''} {v.vehicle_type or ''}".strip() for v in vehicles

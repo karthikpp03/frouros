@@ -10,6 +10,8 @@ import os
 import torch
 from dotenv import load_dotenv
 
+from utils.device import DEVICE
+
 load_dotenv()
 
 # ==================================================
@@ -81,6 +83,26 @@ DEBUG_DIR         = os.path.join(DATA_DIR, "debug_rejected")
 MEMORY_FILE       = os.path.join(DATA_DIR, "event_memory.json")
 REID_GALLERY_FILE = os.path.join(DATA_DIR, "reid_gallery.json")
 
+# ==================================================
+# FACE RECOGNITION (InsightFace / ArcFace)
+# ==================================================
+# FACES_DIR: reference-photo folders, one per registered person —
+#   faces/Dad/1.jpg, faces/Dad/2.jpg, faces/Mom/1.jpg, ...
+#   face/face_db.build_face_database() scans this to build the database.
+# FACE_DATABASE_FILE: the pre-built local face database (pickle) —
+#   {person_name: {"embedding": np.ndarray, "registered_at": iso_str}}
+#   — that face/recognizer.py loads exactly once at startup.
+# FACE_RECOGNITION_THRESHOLD: minimum cosine similarity (ArcFace
+#   normed embeddings, so cosine similarity == dot product) for a
+#   match to count as a recognized person rather than "Unknown".
+FACES_DIR                  = os.path.join(BASE_DIR, "faces")
+FACE_DATABASE_FILE         = os.path.join(DATA_DIR, "face_database.pkl")
+FACE_RECOGNITION_THRESHOLD = float(os.getenv("FACE_RECOGNITION_THRESHOLD", "0.45"))
+INSIGHTFACE_HOME = os.getenv(
+    "INSIGHTFACE_HOME",
+    os.path.join(DATA_DIR, "insightface")
+)
+
 # Output folder for the merged (3-frames-in-1) images sent to OpenAI
 # Vision. Only used on the OpenAI branch of services/summary_router.py
 # — Qwen keeps using the 3 separate smart frames as before.
@@ -118,16 +140,26 @@ REID_DIM = 2048   # ResNet50 default; overwritten to 512 for fallback
 # ==================================================
 # QUANTIZATION CONFIG
 # Swap load_in_4bit → load_in_8bit for Jetson Orin
+#
+# 4-bit (bitsandbytes) quantization only works on CUDA — on a CPU-only
+# system BNB_CONFIG is None and models/qwen_vl.py / models/smolvlm.py
+# load the model unquantized (fp32) on CPU instead. This is the only
+# device-dependent behaviour difference, and it exists because 4-bit
+# quantization has no CPU backend, not because of a routing/pipeline
+# change.
 # ==================================================
 
 from transformers import BitsAndBytesConfig
 
-BNB_CONFIG = BitsAndBytesConfig(
-    load_in_4bit=True,
-    bnb_4bit_compute_dtype=torch.float16,
-    bnb_4bit_use_double_quant=True,
-    bnb_4bit_quant_type="nf4"
-)
+if DEVICE.type == "cuda":
+    BNB_CONFIG = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_compute_dtype=torch.float16,
+        bnb_4bit_use_double_quant=True,
+        bnb_4bit_quant_type="nf4"
+    )
+else:
+    BNB_CONFIG = None
 
 # ==================================================
 # ROI POLYGON  (pixel coordinates, closed polygon)

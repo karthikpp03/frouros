@@ -51,6 +51,7 @@ from transformers import (
 )
 
 from config.settings import BNB_CONFIG
+from utils.device import DEVICE, log_gpu_memory, empty_cache
 
 # Hardcoded per spec — SmolVLM2 is a separate, explicit opt-in model.
 # (config.settings.QWEN_MODEL_ID is Qwen's own setting and is
@@ -86,15 +87,19 @@ def load_qwen():
 
     print("[INFO] Loading SmolVLM2-2.2B-Instruct (4-bit)...")
     print("===================================")
-    print("Before loading SmolVLM2")
-    print(torch.cuda.memory_summary())
+    log_gpu_memory("Before loading SmolVLM2")
     print("===================================")
+
+    load_kwargs = dict(
+        device_map=str(DEVICE),
+        torch_dtype=torch.float16 if DEVICE.type == "cuda" else torch.float32,
+    )
+    if BNB_CONFIG is not None:
+        load_kwargs["quantization_config"] = BNB_CONFIG
 
     qwen_model = AutoModelForImageTextToText.from_pretrained(
         SMOLVLM_MODEL_ID,
-        quantization_config=BNB_CONFIG,
-        device_map="cuda",
-        torch_dtype=torch.float16,
+        **load_kwargs,
     )
 
     processor = AutoProcessor.from_pretrained(SMOLVLM_MODEL_ID)
@@ -103,8 +108,7 @@ def load_qwen():
 
     print(f"[INFO] Loaded {SMOLVLM_MODEL_ID}...")
     print("===================================")
-    print("After loading SmolVLM2")
-    print(torch.cuda.memory_summary())
+    log_gpu_memory("After loading SmolVLM2")
     print("===================================")
 
 
@@ -133,7 +137,7 @@ def unload_qwen():
     # tensors only reachable through them) are actually freed before
     # we ask CUDA's caching allocator to release its unused pool.
     gc.collect()
-    torch.cuda.empty_cache()
+    empty_cache()
 
     print("[INFO] SmolVLM2-2.2B-Instruct unloaded.")
 
@@ -184,7 +188,7 @@ def _qwen_infer(messages, pil_images=None, max_new_tokens=250):
             "on the GPU permanently."
         )
 
-    torch.cuda.empty_cache()
+    empty_cache()
     gc.collect()
 
     # Resize any embedded images down to the model's native single-tile
@@ -218,7 +222,7 @@ def _qwen_infer(messages, pil_images=None, max_new_tokens=250):
     # caller once ALL calls for this event are done), this keeps peak
     # GPU usage as low as possible during generation.
     del inputs, generated_ids
-    torch.cuda.empty_cache()
+    empty_cache()
     gc.collect()
 
     # SmolVLM2's chat template renders the turn marker as "Assistant:"

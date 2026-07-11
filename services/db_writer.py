@@ -57,7 +57,7 @@ def _get_db() -> DatabaseManager:
     return _db
 
 
-def build_structured_from_qwen(summary_text, persons_attrs):
+def build_structured_from_qwen(summary_text, persons_attrs, person_name=None, confidence=None):
     """
     Build a structured dict with the same shape OpenAI returns, from
     the Qwen pipeline's existing output — so both providers can be
@@ -69,6 +69,16 @@ def build_structured_from_qwen(summary_text, persons_attrs):
                         extract_person_attributes() output. Each dict
                         has keys: appearance, actions, objects,
                         movement, waiting.
+        person_name:   str | None — the real, recognized identity from
+                        face/recognizer.py (e.g. "Dad", "Mom", "Priya")
+                        if this event was routed to Qwen because a
+                        registered face was recognized. None for
+                        unrecognized / face-recognition-disabled
+                        events. Applied to the primary (first) person
+                        record — the actual name is always stored,
+                        never a placeholder like "Known Person".
+        confidence:    float | None — the recognition confidence score
+                        (0-100) that goes with person_name.
     """
     persons = []
     actions = []
@@ -79,8 +89,11 @@ def build_structured_from_qwen(summary_text, persons_attrs):
         if not isinstance(attrs, dict):
             continue
 
+        is_recognized_primary = (i == 0 and person_name)
+
         persons.append({
-            "known_status": "unknown",
+            "known_status": "known" if is_recognized_primary else "unknown",
+            "person_name": person_name if is_recognized_primary else "Unknown",
             "gender": _NOT_VISIBLE,
             "estimated_age": _NOT_VISIBLE,
             "height": _NOT_VISIBLE,
@@ -96,7 +109,7 @@ def build_structured_from_qwen(summary_text, persons_attrs):
             "accessories": _NOT_VISIBLE,
             "bag": _NOT_VISIBLE,
             "dominant_hand": _NOT_VISIBLE,
-            "confidence": None,
+            "confidence": confidence if is_recognized_primary else None,
         })
 
         for seq, act in enumerate(attrs.get("actions") or [], start=1):
@@ -206,7 +219,7 @@ def persist_event(
 
     persons = [
         Person(event_id=event.event_id, **{
-            k: v for k, v in p.items()
+            k: v for k, v in {**{"person_name": "Unknown"}, **p}.items()
             if k in Person.__dataclass_fields__
         })
         for p in (structured.get("persons") or [])
