@@ -1,0 +1,187 @@
+Aama bro 😄. Docker-la **entha file change pannirukka** nu poruththu different commands use pannuvom.
+
+# 1️⃣ Python code mattum change panna (Most Common)
+
+Example:
+
+* `src/main.py`
+* `models/*.py`
+* `database/*.py`
+* `telegram/*.py`
+
+**Need build?** ❌ No
+
+Just restart:
+
+### GPU
+
+```bash
+docker compose down
+docker compose up
+```
+
+### CPU
+
+```bash
+docker compose -f docker-compose.cpu.yml down
+docker compose -f docker-compose.cpu.yml up
+```
+
+---
+
+# 2️⃣ `requirements.txt` change panna
+
+Example:
+
+* New package install
+* Package version change
+
+**Need build?** ✅ Yes
+
+### GPU
+
+```bash
+docker compose down
+docker compose build
+docker compose up
+```
+
+### CPU
+
+```bash
+docker compose -f docker-compose.cpu.yml down
+docker compose -f docker-compose.cpu.yml build
+docker compose -f docker-compose.cpu.yml up
+```
+
+---
+
+# 3️⃣ Dockerfile change panna
+
+**Need build?** ✅ Yes
+
+```bash
+docker compose down
+docker compose build
+docker compose up
+```
+
+---
+
+# 4️⃣ docker-compose.yml change panna
+
+Example:
+
+* Volumes
+* Environment
+* GPU settings
+
+**Need restart?** ✅ Yes
+
+```bash
+docker compose down
+docker compose up
+```
+
+Sometimes build not needed unless Dockerfile also changed.
+
+---
+
+# 5️⃣ `.env` change panna
+
+Example:
+
+```env
+USE_OPENAI=false
+ENABLE_FACE_RECOGNITION=true
+```
+
+Restart podhum.
+
+```bash
+docker compose down
+docker compose up
+```
+
+No build.
+
+---
+
+# 6️⃣ Force clean build
+
+When Docker cache problem irundha.
+
+```bash
+docker compose down
+docker compose build --no-cache
+docker compose up
+```
+
+---
+
+# 7️⃣ Running container-ku restart pannalama?
+
+```bash
+docker compose restart
+```
+
+But naan recommend panna maaten.
+
+Better:
+
+```bash
+docker compose down
+docker compose up
+```
+
+Cleaner.
+
+---
+
+# 🚀 My Recommendation
+
+## Everyday Development (90% of the time)
+
+Python code mattum change pannuva.
+
+Use:
+
+```bash
+docker compose down
+docker compose up
+```
+
+---
+
+## New library install
+
+```bash
+docker compose down
+docker compose build
+docker compose up
+```
+
+---
+
+## Big changes / Docker issues
+
+```bash
+docker compose down
+docker compose build --no-cache
+docker compose up
+```
+
+---
+
+# 📋 Quick Cheat Sheet
+
+| Changed File         | Build Required? | Command                                                                       |
+| -------------------- | --------------- | ----------------------------------------------------------------------------- |
+| `*.py`               | ❌ No            | `docker compose down && docker compose up`                                    |
+| `.env`               | ❌ No            | `docker compose down && docker compose up`                                    |
+| `requirements.txt`   | ✅ Yes           | `docker compose down && docker compose build && docker compose up`            |
+| `Dockerfile`         | ✅ Yes           | `docker compose down && docker compose build && docker compose up`            |
+| `docker-compose.yml` | ❌ Usually No    | `docker compose down && docker compose up`                                    |
+| Docker cache issue   | ✅ Clean Build   | `docker compose down && docker compose build --no-cache && docker compose up` |
+
+This is the workflow I recommend for your project. Most days you'll only need a simple restart after changing Python code, and only rebuild when dependencies or the Docker image itself changes.
