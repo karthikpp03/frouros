@@ -22,6 +22,35 @@ from memory.faiss_index  import faiss_search, _faiss_index
 from models.groq_query_engine import _llama_infer
 from prompts.query_prompts import LLAMA_SYSTEM_PROMPT, INTENT_PATTERNS
 
+# Phase 2 — Telegram/Groq now answers from SQLite instead of the JSON
+# event memory file. Per the integration spec: Telegram/Groq must NEVER
+# call OpenAI Vision, never re-analyze images, and never regenerate
+# summaries — it only reads whatever is already in the `events` /
+# `persons` / `movement` / `actions` / `objects` / `vehicles` /
+# `keywords` tables (written once, at event-close time, by
+# services/db_writer.py) and asks Groq to phrase an answer from that.
+#
+# find_matching_crops() below still reads memory/event_memory.py (JSON)
+# + the FAISS ReID index for photo lookups — that is a pre-existing,
+# working feature unrelated to this integration (crop-image retrieval,
+# not summary generation) and is left untouched.
+from database.db_manager import DatabaseManager
+from utils.event_logger import log_block
+
+_db = DatabaseManager()
+
+# Objects worth trying as a `keywords` table lookup before falling back
+# to "give me every recent event" — keeps Telegram/Groq's SQLite reads
+# narrow ("only the relevant records") instead of dumping the whole DB.
+_KNOWN_OBJECT_KEYWORDS = [
+    "bag", "backpack", "phone", "umbrella", "bottle",
+    "helmet", "laptop", "box", "parcel", "package",
+]
+
+# Hard cap on how many events we ever pull back for a single query, so
+# context sent to Groq stays small regardless of how large the DB gets.
+_MAX_EVENTS_PER_QUERY = 25
+
 
 # --------------------------------------------------
 # INTENT CLASSIFIER  (unchanged)
@@ -113,6 +142,103 @@ def build_structured_context(memory, query, intents):
 
 
 # --------------------------------------------------
+# SQLITE RETRIEVAL  (Phase 2 — Telegram/Groq's only data source)
+# --------------------------------------------------
+
+def _relevant_events_from_db(query, intents):
+    """
+    Python-side retrieval step in the Telegram flow:
+        Groq (intent) -> Python retrieves ONLY relevant records from
+        SQLite -> Groq (answer).
+
+    Tries a narrow keyword-table lookup first (cheap, precise); falls
+    back to the most recent events (still capped) so a question with
+    no exact keyword match still gets an answer. Never fetches the
+    whole database.
+
+    Returns: list[database.models.Event]
+    """
+    q = query.lower()
+
+    # 1) Try a keyword-table hit for any object explicitly named in the
+    #    question — this is the "only delivery events" / "who carried a
+    #    parcel" style narrow lookup from the integration spec.
+    for kw in _KNOWN_OBJECT_KEYWORDS:
+        if kw in q:
+            hits = _db.search_events(keyword=kw)
+            if hits:
+                return hits[:_MAX_EVENTS_PER_QUERY]
+
+    # 2) time_query intent — pull everything in range and let the
+    #    existing hour-of-day filter (below, in build_structured_context)
+    #    narrow it further; SQLite only helps us cap volume here.
+    #    (No explicit date parsing beyond hour-of-day is attempted, to
+    #    keep behaviour identical to the pre-Phase-2 JSON-memory path.)
+
+    # 3) Fallback — most recent events, still capped, never the full table.
+    events = _db.search_events()
+    return events[:_MAX_EVENTS_PER_QUERY]
+
+
+def build_structured_context_from_db(events, query, intents):
+    """
+    SQLite equivalent of build_structured_context() below — pulls each
+    event's persons/movement/actions/objects/vehicles/keywords via
+    DatabaseManager and renders the same kind of plain-text block for
+    Groq. Only ever called with the ALREADY-FILTERED `events` list from
+    _relevant_events_from_db() — never queries every table for every
+    event in the database.
+    """
+    if not events:
+        return "No events recorded yet."
+
+    parts = []
+    for event in events:
+        if "time_query" in intents:
+            hour = _parse_hour(event.start_time or "")
+            if hour is not None and not _time_matches_query(hour, query):
+                continue
+
+        s = (
+            f"[Event #{event.event_id} | {event.start_time} | "
+            f"{event.duration_seconds or 0:.0f}s | provider={event.ai_provider}]\n"
+            f"Summary: {event.summary}\n"
+        )
+
+        for p in _db.get_persons_by_event(event.event_id):
+            s += (
+                f"  Person [{p.known_status or 'unknown'}]: "
+                f"gender={p.gender}, age={p.estimated_age}, "
+                f"top={p.top_clothing}, bottom={p.bottom_clothing}, "
+                f"bag={p.bag}, headwear={p.headwear}\n"
+            )
+
+        for m in _db.get_movement_by_event(event.event_id):
+            s += (
+                f"  Movement: entry={m.entry_point}, exit={m.exit_point}, "
+                f"direction={m.direction}, loitering={bool(m.loitering)}\n"
+            )
+
+        acts = _db.get_actions_by_event(event.event_id)
+        if acts:
+            s += "  Actions: " + ", ".join(a.action for a in acts) + "\n"
+
+        objs = _db.get_objects_by_event(event.event_id)
+        if objs:
+            s += "  Objects: " + ", ".join(o.object_type for o in objs) + "\n"
+
+        vehicles = _db.get_vehicles_by_event(event.event_id)
+        if vehicles:
+            s += "  Vehicles: " + ", ".join(
+                f"{v.color or ''} {v.vehicle_type or ''}".strip() for v in vehicles
+            ) + "\n"
+
+        parts.append(s)
+
+    return "\n".join(parts) if parts else "No matching events found."
+
+
+# --------------------------------------------------
 # IMAGE RETRIEVAL — FAISS + keyword fallback  (unchanged)
 # --------------------------------------------------
 
@@ -189,16 +315,35 @@ def find_matching_crops(query, memory, query_embedding=None):
 
 def query_memory(query, query_embedding=None):
     """
-    Full query pipeline: classify → build context → Llama inference.
-    Returns (answer_str, [img_paths]).
-    Identical to the original query_memory().
+    Full Telegram/Groq query pipeline (Phase 2):
+        Groq/regex classify_intent() -> Python retrieves ONLY the
+        relevant records from SQLite (_relevant_events_from_db) ->
+        those records are rendered into a small context block
+        (build_structured_context_from_db) -> Groq/Llama answers.
+
+    OpenAI Vision is NEVER called here, no image is ever re-analyzed,
+    and no summary is ever regenerated — this function only reads rows
+    that services/db_writer.py already wrote to SQLite when each event
+    closed. Returns (answer_str, [img_paths]).
+
+    Photo lookups (image_request intent) still use the pre-existing
+    JSON-memory + FAISS ReID crop index (find_matching_crops below) —
+    that is a separate, already-working feature (returning an existing
+    saved photo, not analyzing a new one) and is left untouched.
     """
-    memory      = load_memory()
     intents     = classify_intent(query)
-    context     = build_structured_context(memory, query, intents)
+
+    log_block("GROQ", "Generating response...")
+
+    events      = _relevant_events_from_db(query, intents)
+
+    log_block("DATABASE", "Searching SQLite...", f"Retrieved {len(events)} Events")
+
+    context     = build_structured_context_from_db(events, query, intents)
     image_paths = []
 
     if "image_request" in intents:
+        memory      = load_memory()
         crops       = find_matching_crops(query, memory, query_embedding)
         image_paths = [c[0] for c in crops]
 
@@ -213,4 +358,5 @@ def query_memory(query, query_embedding=None):
     )
 
     output = _llama_infer(LLAMA_SYSTEM_PROMPT, user_prompt, max_new_tokens=300)
+    log_block("GROQ", "Answer generated.")
     return output, image_paths

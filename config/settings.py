@@ -25,14 +25,35 @@ BASE_URL = f"https://api.telegram.org/bot{BOT_TOKEN}"
 # ==================================================
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-GROQ_MODEL = "llama-3.1-8b-instant"
+GROQ_MODEL = "llama-3.3-70b-versatile"
+
+# ==================================================
+# AI MODE ROUTING — Qwen (local, free) vs OpenAI Vision (cloud, paid)
+# See services/summary_router.py for the single place this is used.
+#
+# USE_OPENAI=false               -> always Qwen, OpenAI is never
+#                                    imported/initialized/called.
+# USE_OPENAI=true  + face OFF    -> always OpenAI (testing mode, used
+#                                    before the face-recognition model
+#                                    exists — see face/recognizer.py).
+# USE_OPENAI=true  + face ON     -> known face -> Qwen (free)
+#                                    unknown face -> OpenAI (paid)
+# ==================================================
+
+USE_OPENAI              = os.getenv("USE_OPENAI", "false").strip().lower() == "true"
+ENABLE_FACE_RECOGNITION = os.getenv("ENABLE_FACE_RECOGNITION", "false").strip().lower() == "true"
+
+# Never hardcode a key or model name — always read from .env.
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+OPENAI_MODEL   = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
 
 # ==================================================
 # MODEL PATHS / IDS
 # ==================================================
 
-YOLO_MODEL_PATH  = "/content/drive/MyDrive/cctv/model/yolo26m.pt"
-QWEN_MODEL_ID    = "Qwen/Qwen2.5-VL-7B-Instruct"
+YOLO_MODEL_PATH = "/app/models/yolo26m.pt"
+QWEN_MODEL_ID = "Qwen/Qwen2.5-VL-3B-Instruct"
+#QWEN_MODEL_ID = "HuggingFaceTB/SmolVLM2-2.2B-Instruct"
 VIDEOMAE_MODEL   = "MCG-NJU/videomae-base"
 
 # FastReID weight paths (adjust to your fastreid clone)
@@ -43,7 +64,7 @@ FASTREID_WEIGHTS = "pretrained/market_bot_R50.pth"
 # VIDEO SOURCE
 # ==================================================
 
-VIDEO_PATH = "/content/drive/MyDrive/cctv/events/test.mp4"
+VIDEO_PATH = "/app/video/sample.mp4"
 
 # ==================================================
 # DATA DIRECTORIES
@@ -59,6 +80,11 @@ DEBUG_DIR         = os.path.join(DATA_DIR, "debug_rejected")
 
 MEMORY_FILE       = os.path.join(DATA_DIR, "event_memory.json")
 REID_GALLERY_FILE = os.path.join(DATA_DIR, "reid_gallery.json")
+
+# Output folder for the merged (3-frames-in-1) images sent to OpenAI
+# Vision. Only used on the OpenAI branch of services/summary_router.py
+# — Qwen keeps using the 3 separate smart frames as before.
+MERGED_EVENTS_DIR = os.path.join(DATA_DIR, "merged_events")
 
 # ==================================================
 # VIDEO SETTINGS
@@ -110,14 +136,15 @@ BNB_CONFIG = BitsAndBytesConfig(
 import numpy as np
 
 ROI_POINTS = np.array([
-    (3, 226),
-    (37, 231),
-    (202, 185),
-    (232, 155),
-    (396, 151),
-    (383, 170),
-    (392, 183),
-    (498, 355),
-    (3, 355),
-    (2, 225),
+    (45, 354),
+    (279, 185),
+    (335, 193),
+    (345, 178),
+    (341, 145),
+    (375, 119),
+    (571, 136),
+    (555, 228),
+    (615, 246),
+    (636, 357),
+    (46, 355),
 ])

@@ -1,0 +1,35 @@
+services:
+  frouros:
+    build: .
+    container_name: frouros-ai
+
+    user: "${UID}:${GID}"
+    env_file:
+      - .env
+    environment:
+      HOME: /home/appuser
+      TRITON_CACHE_DIR: /tmp/triton
+      XDG_CACHE_HOME: /home/appuser/.cache
+      HF_HOME: /home/appuser/.cache/huggingface
+      TORCH_HOME: /home/appuser/.cache/torch
+      MPLCONFIGDIR: /home/appuser/.config/matplotlib
+      YOLO_CONFIG_DIR: /home/appuser/.config/Ultralytics
+
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+    volumes:
+      - .:/app
+      - ~/.cache/huggingface:/home/appuser/.cache/huggingface
+      - ~/.cache/torch:/home/appuser/.cache/torch
+      - ~/.cache/ultralytics:/home/appuser/.config/Ultralytics
+
+    working_dir: /app
+
+    stdin_open: true
+    tty: true

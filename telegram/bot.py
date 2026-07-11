@@ -15,6 +15,7 @@ import threading
 
 from config.settings import CHAT_ID, BASE_URL
 from telegram.alerts  import tg_send_message, tg_send_photo, tg_get_updates
+from utils.event_logger import log_bar, log_block
 
 # Imported lazily inside bot_poll_loop to avoid circular imports at module load.
 # pipelines.query_pipeline → memory.event_memory → (no models needed at import)
@@ -42,13 +43,13 @@ def bot_poll_loop():
     from pipelines.query_pipeline import query_memory
 
     bot_offset = _get_telegram_offset()
-    print(f"[Telegram] Bot ready (chat_id: {CHAT_ID}), offset={bot_offset}")
+    print(f"[TELEGRAM] Bot ready (chat_id: {CHAT_ID}), offset={bot_offset}")
 
     while bot_running:
         try:
             updates = tg_get_updates(bot_offset)
         except Exception as e:
-            print(f"[Telegram] Poll error: {e}")
+            print(f"[TELEGRAM] Poll error: {e}")
             time.sleep(2)
             continue
 
@@ -69,7 +70,8 @@ def bot_poll_loop():
             if text.startswith("/") and text not in ("/status", "/help"):
                 continue
 
-            print(f"[Telegram] Query received: {text}")
+            log_bar()
+            log_block("TELEGRAM", "Incoming Question", text)
             tg_send_message(chat_id, "⏳ Searching memory...")
 
             try:
@@ -97,16 +99,18 @@ def bot_poll_loop():
                         tg_send_photo(chat_id, img_path,
                                       caption=f"Matching person {i+1}")
 
+                log_bar()
+
             except Exception as e:
                 tg_send_message(chat_id, f"Sorry, an error occurred: {e}")
-                print(f"[Telegram] Query error: {e}")
+                print(f"[TELEGRAM] Query error: {e}")
 
         if len(_processed_updates) > 5000:
             _processed_updates.clear()
 
         time.sleep(0.5)
 
-    print("[Telegram] Bot loop exited cleanly.")
+    print("[TELEGRAM] Bot loop exited cleanly.")
 
 
 def start_bot_thread():

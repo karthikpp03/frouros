@@ -7,51 +7,68 @@ Functions return fully-formed message dicts ready for _qwen_infer().
 
 from prompts.grounding_rules import _GROUNDING_RULES
 
-
 def build_summary_messages(pil_images):
     """
     Returns the messages list passed to _qwen_infer() for event summarisation.
-    Exactly preserves the original inline prompt text.
+    Images are interleaved with explicit stage labels (Beginning/Middle/End)
+    so the model treats them as one temporal sequence instead of three
+    independent images.
     """
-    return [
-        {
-            "role": "user",
-            "content": [
-                *[{"type": "image", "image": img} for img in pil_images],
-                {
-                    "type": "text",
-                    "text": (
-                        f"{_GROUNDING_RULES}\n\n"
-                        "These images are extracted from ONE CCTV event arranged chronologically.\n\n"
+    stage_labels = ["BEGINNING of the event", "MIDDLE of the event", "END of the event"]
 
-                        "Analyze ONLY what is reasonably visible in the frames.\n"
-                        "Do NOT invent conversations, emotions, intentions, or relationships.\n"
-                        "If something is unclear, say 'Not clearly visible'.\n"
-                        "Focus mainly on people, actions, movement, carried objects, waiting behavior, and interactions.\n"
-                        "Maintain temporal consistency across frames.\n\n"
+    content = []
+    for i, img in enumerate(pil_images):
+        label = stage_labels[i] if i < len(stage_labels) else f"Frame {i+1}"
+        content.append({"type": "text", "text": f"--- Frame {i+1} ({label}) ---"})
+        content.append({"type": "image", "image": img})
 
-                        "Write a natural CCTV surveillance event summary.\n\n"
+    content.append({
+        "type": "text",
+        "text": (
+            f"{_GROUNDING_RULES}\n\n"
+            "The 3 images above are consecutive frames from ONE SINGLE CCTV event, "
+            "in strict chronological order: Frame 1 = beginning, Frame 2 = middle, "
+            "Frame 3 = end.\n\n"
 
-                        "For each detected person include naturally:\n"
-                        "- clothing/appearance\n"
-                        "- observed actions\n"
-                        "- movement direction\n"
-                        "- carried objects\n"
-                        "- waiting/loitering behavior\n"
-                        "- interactions if clearly visible\n\n"
+            "Do NOT describe each frame separately or in isolation. Instead, "
+            "COMPARE the frames against each other to infer motion, action "
+            "progression, and behavior change over time, then write ONE "
+            "combined narrative summary of the whole event.\n\n"
 
-                        "The report should feel like a professional CCTV operator summary:\n"
-                        "clear, grounded, chronological, and natural.\n\n"
+            "Specifically:\n"
+            "- Compare the person's position/pose in Frame 1 vs Frame 2 vs Frame 3.\n"
+            "- If the person's position changes between frames, explicitly describe "
+            "the transition (e.g. 'started standing near the entrance, then began "
+            "walking toward the corridor, and finally exited the frame').\n"
+            "- If the person's position does NOT change across all 3 frames, "
+            "explicitly state that they remained stationary throughout the event.\n"
+            "- Describe the overall direction of movement (e.g. left-to-right, "
+            "toward/away from camera) if visible.\n"
+            "- Note any objects carried and whether that changes across frames.\n"
+            "- Note clothing/appearance once (it won't change across frames).\n"
+            "- Describe the final outcome/state as seen in Frame 3.\n\n"
 
-                        "Avoid robotic formatting like 'Person A:' repeatedly.\n"
-                        "Avoid repeating the same sentence structure.\n"
-                        "Avoid excessive speculation.\n"
-                    )
-                }
-            ]
-        }
-    ]
+            "Analyze ONLY what is reasonably visible in the frames.\n"
+            "Do NOT invent conversations, emotions, intentions, or relationships.\n"
+            "If something is unclear, say 'Not clearly visible'.\n\n"
 
+            "Write a natural CCTV surveillance event summary as ONE continuous "
+            "paragraph (or short set of paragraphs) describing the event's motion "
+            "and behavior progression from beginning to end — NOT three separate "
+            "per-frame descriptions.\n\n"
+
+            "The report should feel like a professional CCTV operator summary: "
+            "clear, grounded, chronological, and natural.\n\n"
+
+            "Avoid robotic formatting like 'Person A:' or 'Frame 1:' repeatedly "
+            "in the output — the frame labels above are for your reference only, "
+            "not for the final summary text.\n"
+            "Avoid repeating the same sentence structure.\n"
+            "Avoid excessive speculation.\n"
+        )
+    })
+
+    return [{"role": "user", "content": content}]
 
 def build_attribute_extraction_prompt(summary):
     """

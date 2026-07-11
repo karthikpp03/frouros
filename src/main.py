@@ -1,19 +1,41 @@
 """
 main.py
 =======
-CCTV Surveillance System — v4  (modularized)
+CCTV Surveillance System — v5  (modularized + parallel Event Manager)
 
 Startup order:
   1. Ensure data directories exist + seed empty memory file
-  2. Load models  (YOLO → VideoMAE → ReID → Qwen → Groq)
+  2. Load models  (Groq → ReID)  — Qwen and VideoMAE are NO LONGER loaded
+     here; see the GPU memory note below.
   3. Load gallery (requires REID_DIM set by ReID loader)
-  4. Start Telegram bot thread
-  5. Open video capture
-  6. Main tracking loop (identical to original monolith)
-  7. Finalise last open event (if any)
-  8. Cleanup, bot keepalive, test query
+  4. Load YOLO
+  5. Start Telegram bot thread
+  6. Open video capture
+  7. Main tracking loop — real-time detection/tracking/ReID. Every Track ID
+     seen in the ROI gets its own independent Event via
+     pipelines.event_manager.event_manager: its own recording, its own best
+     frame/crop selection, and its own AI finalisation, all running without
+     ever blocking the live feed or each other. AI processing (VideoMAE,
+     Qwen, Groq, Telegram) happens asynchronously on a background worker
+     thread — see pipelines/event_manager.py for the full design.
+  8. Finalise any Events still open when the video ends
+  9. Cleanup, bot keepalive, test query
 
-All logic inside the main loop is preserved verbatim — only imports changed.
+Detection/tracking/ROI/ReID logic is preserved verbatim from the original
+monolith — only the event lifecycle (previously one shared global recording
+slot) has changed, to support multiple concurrent, non-blocking Events.
+
+GPU MEMORY OPTIMISATION
+------------------------
+YOLO (continuous, every frame) and ReID (CPU-resident) still load here at
+startup, same as before. Qwen2.5-VL-7B and VideoMAE, however, are NO LONGER
+loaded eagerly here — they used to sit on the GPU for the entire process
+lifetime alongside YOLO, leaving too little headroom for Qwen's
+`.generate()` activation spike and causing CUDA OOM. They are now loaded
+on-demand inside pipelines/event_manager.py._finalize_event() (only for the
+brief window they're actually needed, one at a time, never together), and
+fully released again immediately after. See models/qwen_vl.py and
+models/videomae.py for the load_*()/unload_*() pair each one now exposes.
 """
 
 # ── stdlib ──────────────────────────────────────────────────────────────────
@@ -34,36 +56,41 @@ from config.settings import (
     MEMORY_FILE, REID_GALLERY_FILE,
     FRAME_WIDTH, FRAME_HEIGHT,
     MIN_AREA, MIN_CONFIDENCE,
-    REID_GRACE_PERIOD, NO_PERSON_TIMEOUT,
     ROI_POINTS,
     CHAT_ID,
 )
 
 # ── models ────────────────────────────────────────────────────────────────────
 from models.yolo_detector    import load_yolo, run_tracking
-from models.videomae         import load_videomae
 from models.reid             import load_reid, reid_fn as _reid_fn_placeholder
-from models.qwen_vl          import load_qwen
 from models.groq_query_engine import load_groq
+# NOTE: models.qwen_vl.load_qwen() and models.videomae.load_videomae() are
+# intentionally NOT imported/called here anymore. Both are heavy models that
+# used to be loaded once at startup and held on the GPU for the entire
+# process lifetime, alongside YOLO — this permanent co-residency was the
+# root cause of Qwen's CUDA OOM (too little headroom left during
+# `.generate()`). They are now loaded on-demand, one at a time, inside
+# pipelines/event_manager.py._finalize_event() and fully released right
+# after use. See models/qwen_vl.py and models/videomae.py for details.
 
 # ── memory ────────────────────────────────────────────────────────────────────
-from memory.gallery      import (
-    gallery_load, gallery_save,
-    gallery_match, gallery_was_recent, gallery_purge_stale,
-)
-from memory.event_memory import empty_event_record
+from memory.gallery      import gallery_load, gallery_save, gallery_match
 
 # ── pipelines ─────────────────────────────────────────────────────────────────
-import pipelines.event_pipeline as ep   # mutable state lives here
+# NOTE: pipelines/event_pipeline.py (the single-global-event pipeline) is kept
+# in place untouched, but main.py no longer drives the event lifecycle through
+# it directly. It has been superseded by pipelines/event_manager.py, which
+# gives every Track ID its own independent Event (own recording, own best
+# frame/crop, own AI finalisation) so multiple people in the ROI can be
+# tracked and summarised in parallel without blocking each other or the live
+# feed. See pipelines/event_manager.py for the full design rationale.
+from pipelines.event_manager import event_manager
 
 # ── telegram ─────────────────────────────────────────────────────────────────
 from telegram.bot    import start_bot_thread, stop_bot
-from telegram.alerts import tg_send_message
 
 # ── utils ─────────────────────────────────────────────────────────────────────
 from utils.roi_utils   import is_inside_roi, draw_roi
-from utils.crop_utils  import crop_update
-from utils.image_utils import try_update_best_frame, reset_best_frame
 from utils.debug_utils import save_rejected_detection
 
 # ── query pipeline (for the post-run test) ───────────────────────────────────
@@ -86,15 +113,34 @@ if not os.path.exists(MEMORY_FILE):
     with open(MEMORY_FILE, "w") as f:
         json.dump([], f)
 
+# ── Phase 2 (additive): SQLite database bootstrap ────────────────────────────
+# Creates data/frouros.db + every table in database/schema.sql if missing
+# (safe/idempotent — every CREATE TABLE uses IF NOT EXISTS). Nothing else
+# in this file changes: pipelines/event_manager.py writes to this database
+# on its own via services/db_writer.py, and pipelines/query_pipeline.py
+# reads from it for Telegram/Groq queries.
+from database import DatabaseManager, Camera
+
+_db = DatabaseManager()
+_db.create_database()
+_db.create_tables()
+_db.insert_camera(Camera(
+    camera_id="cam_default",
+    camera_name="Default Camera",
+    location=None,
+    roi_name="main_roi",
+))
+
 
 # ==============================================================================
-# 2. MODEL LOADING  (identical startup sequence to the original)
+# 2. MODEL LOADING
+# Qwen2.5-VL-7B and VideoMAE are intentionally NOT loaded here anymore — see
+# the "GPU MEMORY OPTIMISATION" note in the module docstring above. They are
+# loaded on-demand, one at a time, during event finalisation instead.
 # ==============================================================================
 
-load_qwen()         # Qwen2.5-VL-7B  — heaviest; load first so OOM surfaces early
-load_groq()         # Groq / Llama-3.1-8B-instant
-load_videomae()     # VideoMAE (CPU)
-load_reid()         # FastReID → OSNet → ResNet18 fallback chain
+load_groq()         # Groq / Llama-3.1-8B-instant (cloud API — no local GPU/RAM cost)
+load_reid()         # FastReID → OSNet → ResNet18 fallback chain (CPU-resident)
 
 # After load_reid() REID_DIM is finalised in config.settings — gallery can now build index
 gallery_load()
@@ -126,32 +172,25 @@ fps = int(cap.get(cv2.CAP_PROP_FPS))
 
 
 # ==============================================================================
-# 6. EVENT / RECORDING STATE
-# (mirrors the original module-level globals exactly)
+# 6. FRAME COUNTER
+# (recording / event-id / best-frame / best-crop state used to live here as
+#  module-level globals sized for ONE concurrent event. That state now lives
+#  per-Track-ID inside pipelines/event_manager.py's TrackEvent instances, so
+#  multiple people in the ROI get independent, non-interfering Events.)
 # ==============================================================================
-
-recording        = False
-video_writer     = None
-event_id         = 0
-event_start_time = 0
-output_path      = ""
-
-last_detection_time = 0
-active_reid_ids     = set()
 
 frame_index = 0   # used by debug_utils
 
 
 # ==============================================================================
 # 7. MAIN TRACKING LOOP
-# Logic is byte-for-byte identical to the original — only the inline helpers
-# (draw_roi, save_rejected_detection, is_inside_roi, try_update_best_frame,
-#  crop_update, gallery_match, gallery_was_recent, gallery_purge_stale,
-#  empty_event_record, close_event, reset_event_state)
-# are now imported from their respective modules.
+# Detection / ROI-filtering / debug-rejects / ROI drawing logic is unchanged.
+# The single shared "recording" slot has been replaced by pipelines/event_
+# manager.event_manager, which gives every Track ID its own independent Event
+# (own VideoWriter, own best frame/crop, own AI finalisation running on a
+# background thread) — so this loop never waits on AI, and N people in the
+# ROI get N events running in parallel instead of one shared/blocking event.
 # ==============================================================================
-
-from datetime import datetime
 
 while True:
     ret, frame = cap.read()
@@ -159,6 +198,7 @@ while True:
         break
 
     frame_index += 1
+    now   = time.time()
     frame = cv2.resize(frame, (FRAME_WIDTH, FRAME_HEIGHT))
     draw_roi(frame)
 
@@ -187,115 +227,42 @@ while True:
             if not is_inside_roi(cx, cy):
                 continue
 
-            detections_in_roi.append((x1, y1, x2, y2, track_id, confidence))
+            # ── ReID: identify WHO this track_id belongs to (unchanged) ────
+            crop = frame[max(0, y1-10):y2+10, max(0, x1-10):x2+10]
+            reid_id = None
+            if crop.size:
+                emb          = reid_fn(crop)
+                reid_id, sim = gallery_match(emb)
 
-            score = area * confidence
-            try_update_best_frame(frame, score)
+            detections_in_roi.append(
+                (x1, y1, x2, y2, track_id, confidence, reid_id)
+            )
 
             cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
 
-    person_in_roi = len(detections_in_roi) > 0
+    # ── EVENT MANAGER: create/update one independent Event per Track ID ────
+    # Non-blocking — only opens VideoWriters and updates in-memory trackers.
+    # A brand-new Track ID gets a brand-new Event immediately; an existing
+    # Track ID just gets its own event fed this frame.
+    if detections_in_roi:
+        event_manager.update_detections(frame, detections_in_roi, fps, now)
 
-    if person_in_roi:
-        for (x1, y1, x2, y2, track_id, conf) in detections_in_roi:
-            crop = frame[max(0, y1-10):y2+10, max(0, x1-10):x2+10]
-            if crop.size == 0:
-                continue
-
-            # FastReID embedding
-            emb          = reid_fn(crop)
-            reid_id, sim = gallery_match(emb)
-            active_reid_ids.add(reid_id)
-            ep.track_to_reid_id[track_id] = reid_id
-
-            # Best crop keyed by reid_id (dedup fix)
-            crop_update(frame, track_id, reid_id, x1, y1, x2, y2, conf)
-
-        last_detection_time = time.time()
-
-        if not recording:
-            print(f"[EVENT START] Event {event_id}")
-            event_start_time    = time.time()
-            output_path         = f"{EVENTS_DIR}/event_{event_id}.mp4"
-            fourcc              = cv2.VideoWriter_fourcc(*"mp4v")
-            video_writer        = cv2.VideoWriter(
-                output_path, fourcc, fps, (FRAME_WIDTH, FRAME_HEIGHT)
-            )
-            recording           = True
-            ep.current_event    = empty_event_record(
-                event_id, datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            )
-            ep.track_to_person_idx = {}
-            ep.reid_to_person_idx  = {}
-            ep.person_counter      = 0
-
-        # ── DEDUP via reid_to_person_idx ──────────────────────────────────
-        for (x1, y1, x2, y2, track_id, conf) in detections_in_roi:
-            reid_id = ep.track_to_reid_id.get(track_id)
-            if reid_id is None:
-                continue
-
-            if reid_id in ep.reid_to_person_idx:
-                pidx = ep.reid_to_person_idx[reid_id]
-                ep.track_to_person_idx[track_id] = pidx
-                continue
-
-            if track_id not in ep.track_to_person_idx:
-                ep.person_counter += 1
-                ep.track_to_person_idx[track_id] = ep.person_counter
-                ep.reid_to_person_idx[reid_id]   = ep.person_counter
-
-                from memory.event_memory import empty_person_record
-                pid   = f"event{event_id}_person{ep.person_counter}"
-                p_rec = empty_person_record(pid, track_id, event_id)
-                p_rec["reid_id"]    = reid_id
-                p_rec["first_seen"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                ep.current_event["persons"].append(p_rec)
-
-    if recording:
-        video_writer.write(frame)
-
-    if recording:
-        elapsed = time.time() - last_detection_time
-        grace   = REID_GRACE_PERIOD if active_reid_ids else NO_PERSON_TIMEOUT
-
-        if elapsed > grace:
-            identity_returned = any(
-                gallery_was_recent(rid) for rid in active_reid_ids
-            )
-
-            if identity_returned and elapsed < REID_GRACE_PERIOD * 2:
-                pass
-            else:
-                print(f"[EVENT END] Event {event_id}")
-                recording = False
-                video_writer.release()
-
-                ep.close_event(
-                    event_id, output_path, event_start_time, ep.current_event
-                )
-
-                active_reid_ids  = set()
-                ep.track_to_reid_id = {}
-                ep.current_event = None
-                event_id        += 1
-
-                gallery_purge_stale()
+    # ── Close any Track ID that left the ROI / timed out. Each event is
+    # evaluated and closed independently — closing one never blocks or
+    # delays any other still-active event. Closed events are handed off to
+    # a background worker for AI summarisation; this call returns instantly.
+    event_manager.tick(now)
 
 
 # ==============================================================================
-# 8. FINALIZE LAST EVENT  (unchanged)
+# 8. FINALIZE ALL STILL-OPEN EVENTS
+# (generalises the original single "finalize last event" step to however
+#  many Track IDs are still active when the video ends)
 # ==============================================================================
 
-if recording:
-    print(f"[FINAL EVENT END] Event {event_id}")
-    recording = False
-    video_writer.release()
-    ep.close_event(event_id, output_path, event_start_time, ep.current_event)
+event_manager.close_all()
 
 cap.release()
-if video_writer is not None:
-    video_writer.release()
 
 gallery_save()
 

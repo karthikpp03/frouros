@@ -25,7 +25,7 @@ def tg_send_message(chat_id, text):
     try:
         requests.post(url, data=data, timeout=10)
     except Exception as e:
-        print(f"[Telegram] Message error: {e}")
+        print(f"[TELEGRAM] Message error: {e}")
 
 
 def tg_send_photo(chat_id, image_path, caption=""):
@@ -39,7 +39,7 @@ def tg_send_photo(chat_id, image_path, caption=""):
                 timeout=15,
             )
     except Exception as e:
-        print(f"[Telegram] Photo error: {e}")
+        print(f"[TELEGRAM] Photo error: {e}")
 
 
 def tg_get_updates(offset):
@@ -70,15 +70,15 @@ def _alert_worker(image_path, caption, ev_id):
                 )
             result = resp.json()
             if result.get("ok"):
-                print(f"[Telegram] Alert sent for Event #{ev_id} (attempt {attempt})")
+                print(f"[TELEGRAM] Alert sent for Event #{ev_id} (attempt {attempt})")
                 return
             else:
-                print(f"[Telegram] Alert attempt {attempt} failed: {result.get('description')}")
+                print(f"[TELEGRAM] Alert attempt {attempt} failed: {result.get('description')}")
         except Exception as e:
-            print(f"[Telegram] Alert attempt {attempt} error: {e}")
+            print(f"[TELEGRAM] Alert attempt {attempt} error: {e}")
         time.sleep(delay)
         delay *= 2
-    print(f"[Telegram] WARNING — Alert for Event #{ev_id} not delivered after 3 attempts.")
+    print(f"[TELEGRAM] WARNING — Alert for Event #{ev_id} not delivered after 3 attempts.")
 
 
 def send_telegram_alert(image_path, summary, duration, timestamp, ev_id):
@@ -87,7 +87,7 @@ def send_telegram_alert(image_path, summary, duration, timestamp, ev_id):
     Spawns _alert_worker in a daemon thread — identical to the original.
     """
     if not os.path.exists(image_path):
-        print(f"[Telegram] Snapshot missing for Event #{ev_id}: {image_path}")
+        print(f"[TELEGRAM] Snapshot missing for Event #{ev_id}: {image_path}")
         return
     caption = (
         f"🚨 EVENT #{ev_id}\n\n"

@@ -16,6 +16,7 @@ import json
 from PIL import Image
 
 from models.qwen_vl import _qwen_infer
+#from models.smolvlm import _qwen_infer
 from prompts.summary_prompts import (
     build_summary_messages,
     build_attribute_extraction_prompt,

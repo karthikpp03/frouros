@@ -1,41 +1,68 @@
+# ==========================================
 # Python
+# ==========================================
 __pycache__/
-*.pyc
-*.pyo
-*.pyd
+*.py[cod]
+*$py.class
 
-# Virtual env
+# ==========================================
+# Virtual Environment
+# ==========================================
 venv/
-.env/
+.env
+.env.*
 
-# Colab
-.ipynb_checkpoints/
+# ==========================================
+# Runtime Data
+# ==========================================
+data/
 
-# AI model cache
-.cache/
-huggingface/
-*.safetensors
-*.bin
-
-# Events and outputs
-events/
-smart_frames/
-person_crops/
-debug_rejected/
-
-# Memory files
-event_memory.json
-reid_gallery.json
-
+# ==========================================
 # Logs
+# ==========================================
+logs/
 *.log
 
-# OS files
+# ==========================================
+# SQLite
+# ==========================================
+*.db
+*.sqlite
+*.sqlite3
+
+# ==========================================
+# AI Models
+# ==========================================
+*.pt
+*.pth
+*.onnx
+*.engine
+*.trt
+*.weights
+*.ckpt
+*.bin
+*.safetensors
+
+# ==========================================
+# HuggingFace / Torch Cache
+# ==========================================
+.cache/
+huggingface/
+torch/
+Ultralytics/
+
+# ==========================================
+# VS Code
+# ==========================================
+.vscode/
+
+# ==========================================
+# JetBrains
+# ==========================================
+.idea/
+
+# ==========================================
+# OS Files
+# ==========================================
 .DS_Store
 Thumbs.db
-
-# Secrets
-.env
-
-
-MODULARIZATION_GUIDE.md
