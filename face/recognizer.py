@@ -141,6 +141,129 @@ def _best_match(embedding: np.ndarray):
     return best_name, best_sim
 
 
+def has_usable_face(image) -> bool:
+    """
+    Cheap pre-check: does this crop actually contain a detectable face?
+
+    Reuses the SAME SCRFD detector already loaded by load_face_recognizer()
+    for recognize_face() below — no second model, no extra load. This lets
+    callers (Worker 1's join processing, best-crop selection) decide
+    "is this crop even worth running full recognition on?" BEFORE
+    spending a recognition call on a legs-only / back-only / feet-only
+    crop that could never match anyone.
+
+    Args:
+        image: a BGR numpy array (e.g. a person crop already in memory)
+               OR a file path string.
+
+    Returns:
+        bool — True only if at least one face was actually detected.
+        Never raises; returns False on any read/detection failure, and
+        False (not True) when face recognition itself is disabled, so
+        callers can gate on this uniformly regardless of config instead
+        of needing a separate ENABLE_FACE_RECOGNITION check everywhere.
+    """
+    if not _ENABLED or _face_app is None:
+        return False
+
+    img = cv2.imread(image) if isinstance(image, str) else image
+    if img is None or not getattr(img, "size", 0):
+        return False
+
+    try:
+        return bool(_face_app.get(img))
+    except Exception:
+        return False
+
+
+def detect_faces(image):
+    """
+    Run SCRFD face detection on ONE image and return every face found
+    — not just the largest — as a list of
+    {"embedding": np.ndarray, "bbox": (x1, y1, x2, y2), "area": float}
+    dicts. Reuses the same already-loaded InsightFace app as
+    has_usable_face()/recognize_face(); never loads anything itself.
+
+    This is the building block behind "Face Recognition must use the
+    best Smart Frame" (see pipelines/event_manager.py's Stage 2
+    identity-resolution step): callers that need to compare/rank
+    individual detected faces across several images (e.g. every
+    VideoMAE Smart Frame) — rather than just getting one auto-picked
+    "best" match back — use this instead of recognize_face().
+
+    Args:
+        image: a BGR numpy array OR a file path string.
+
+    Returns:
+        list[dict] — empty if face recognition is disabled, not yet
+        loaded, the image can't be read, or no face is detected. Never
+        raises.
+    """
+    if not _ENABLED or _face_app is None:
+        return []
+
+    img = cv2.imread(image) if isinstance(image, str) else image
+    if img is None or not getattr(img, "size", 0):
+        return []
+
+    try:
+        detected = _face_app.get(img)
+    except Exception:
+        return []
+
+    faces = []
+    for f in detected:
+        x1, y1, x2, y2 = f.bbox
+        faces.append({
+            "embedding": f.normed_embedding,
+            "bbox":      (float(x1), float(y1), float(x2), float(y2)),
+            "area":      float((x2 - x1) * (y2 - y1)),
+        })
+    return faces
+
+
+def match_embedding(embedding):
+    """
+    Decide who (if anyone) a single already-detected face embedding
+    belongs to — the same DB-comparison + threshold decision
+    recognize_face() makes internally (see _best_match() above and the
+    threshold check below), exposed directly so callers that located
+    their own "best" face themselves (e.g. by comparing several
+    candidate faces detected across multiple images — see
+    detect_faces()) don't have to re-detect anything to get a final
+    (name, confidence) decision.
+
+    Args:
+        embedding: a single ArcFace `normed_embedding` (e.g. from one
+                   entry returned by detect_faces()).
+
+    Returns:
+        (person_name, confidence) — same contract as recognize_face():
+        person_name is the real registered identity or "Unknown",
+        confidence is 0.0-100.0.
+    """
+    if not _ENABLED:
+        return "Unknown", 0.0
+
+    if _face_app is None or _face_db is None:
+        raise RuntimeError(
+            "Face recognition is enabled but not loaded. Call "
+            "load_face_recognizer() once at startup (see src/main.py) "
+            "before match_embedding()."
+        )
+
+    if not _face_db:
+        return "Unknown", 0.0
+
+    name, sim = _best_match(embedding)
+    confidence = max(sim, 0.0) * 100.0
+
+    if name is None or sim < FACE_RECOGNITION_THRESHOLD:
+        return "Unknown", confidence
+
+    return name, confidence
+
+
 def recognize_face(frame_paths):
     """
     Decide who (if anyone) the person in this event is, using the
@@ -180,23 +303,17 @@ def recognize_face(frame_paths):
     best_name, best_sim = None, -1.0
 
     for path in frame_paths or []:
-        img = cv2.imread(path)
-        if img is None:
-            continue
-
-        detected = _face_app.get(img)
-        if not detected:
-            continue
-
         # Largest detected face per frame — the ROI is already scoped
         # to one subject by the rest of the pipeline, so this simply
         # guards against a stray background face winning by accident.
-        face = max(
-            detected,
-            key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]),
-        )
+        # (Reuses detect_faces() — same detection call as before, just
+        # no longer duplicated here.)
+        faces = detect_faces(path)
+        if not faces:
+            continue
+        face = max(faces, key=lambda f: f["area"])
 
-        name, sim = _best_match(face.normed_embedding)
+        name, sim = _best_match(face["embedding"])
         if name is not None and sim > best_sim:
             best_name, best_sim = name, sim
 

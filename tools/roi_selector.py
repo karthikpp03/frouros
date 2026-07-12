@@ -63,6 +63,7 @@ config/settings.py. It's also written to tools/roi_points_output.txt.
 import os
 import re
 import sys
+import json
 import argparse
 
 import cv2
@@ -76,6 +77,26 @@ SETTINGS_PATH = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
     "config", "settings.py",
 )
+
+# config/settings.py auto-loads the ROI polygon from exactly this file
+# on every startup (video, webcam, or future RTSP — identically) — see
+# config.settings._load_roi_points(). No copy/paste into settings.py is
+# required any more; running this tool and confirming a selection is
+# the whole workflow.
+ROI_JSON_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "data", "roi.json",
+)
+
+
+def save_roi_json(points, path=ROI_JSON_PATH):
+    """Persist the selected polygon as {"points": [[x, y], ...]} —
+    the exact shape config.settings._load_roi_points() expects."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    payload = {"points": [[int(x), int(y)] for x, y in points]}
+    with open(path, "w") as f:
+        json.dump(payload, f, indent=4)
+    return path
 
 
 def read_frame_size_from_settings():
@@ -247,6 +268,11 @@ def main():
     with open(out_path, "w") as f:
         f.write(block + "\n")
     print(f"\n[INFO] Also saved to {out_path}")
+
+    json_path = save_roi_json(points)
+    print(f"[INFO] ROI saved to {json_path} — the app now loads this "
+          f"automatically on startup (video, webcam, or RTSP). No manual "
+          f"paste into config/settings.py needed.")
 
 
 if __name__ == "__main__":

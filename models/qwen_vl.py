@@ -59,9 +59,7 @@ def load_qwen():
         return
 
     print("[INFO] Loading Qwen2.5-VL-3B (4-bit)...")
-    print("===================================")
-    log_gpu_memory("Before loading Qwen")
-    print("===================================")
+
 
     load_kwargs = dict(
         device_map=str(DEVICE),

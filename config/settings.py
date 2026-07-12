@@ -63,11 +63,23 @@ FASTREID_CONFIG  = "configs/MSMT17/bagtricks_R50.yml"
 FASTREID_WEIGHTS = "pretrained/market_bot_R50.pth"
 
 # ==================================================
-# VIDEO SOURCE
+# INPUT SOURCE
+# ==================================================
+# The rest of the project must keep working without modification no
+# matter which of these is active — only the capture line in
+# src/main.py reads these; no AI model is ever aware of the input
+# source. Switch source ONLY through .env / these three values:
+#
+#   INPUT_MODE=video   VIDEO_PATH=/app/video/sample.mp4
+#   INPUT_MODE=webcam  CAMERA_INDEX=0
+#   INPUT_MODE=rtsp     RTSP_URL=rtsp://...
 # ==================================================
 
-VIDEO_PATH = "/app/video/sample.mp4"
-
+INPUT_MODE   = os.getenv("INPUT_MODE", "video").strip().lower()   # "video" | "webcam" | "rtsp"
+VIDEO_PATH   = os.getenv("VIDEO_PATH", "/app/video/sample.mp4")
+CAMERA_INDEX = int(os.getenv("CAMERA_INDEX", "0"))
+RTSP_URL     = os.getenv("RTSP_URL", "")
+WEBCAM_DEVICE = os.getenv("WEBCAM_DEVICE", "/dev/video0")
 # ==================================================
 # DATA DIRECTORIES
 # ==================================================
@@ -164,19 +176,48 @@ else:
 # ==================================================
 # ROI POLYGON  (pixel coordinates, closed polygon)
 # ==================================================
+# Configurable — no longer hardcoded. tools/roi_selector.py writes
+# data/roi.json; this loads it automatically on every startup (video
+# file, webcam, or future RTSP — identically, since ROI_POINTS is the
+# only thing any of them ever read). Falls back to the previous
+# hardcoded polygon if data/roi.json doesn't exist yet or is invalid,
+# so a fresh checkout with no roi.json still runs.
+# ==================================================
 
+import json
 import numpy as np
 
-ROI_POINTS = np.array([
-    (45, 354),
-    (279, 185),
-    (335, 193),
-    (345, 178),
-    (341, 145),
-    (375, 119),
-    (571, 136),
-    (555, 228),
-    (615, 246),
+ROI_CONFIG_FILE = os.path.join(DATA_DIR, "roi.json")
+
+_DEFAULT_ROI_POINTS = [
+(225, 357),
+    (297, 320),
+    (295, 262),
+    (339, 243),
+    (475, 274),
+    (533, 278),
+    (594, 191),
+    (636, 207),
     (636, 357),
-    (46, 355),
-])
+    (228, 356),
+]
+
+
+def _load_roi_points():
+    if os.path.exists(ROI_CONFIG_FILE):
+        try:
+            with open(ROI_CONFIG_FILE, "r") as f:
+                data = json.load(f)
+            pts = data.get("points") or []
+            if len(pts) >= 3:
+                return np.array([tuple(p) for p in pts])
+            print(f"[settings] {ROI_CONFIG_FILE} has fewer than 3 points — "
+                  f"falling back to the default ROI_POINTS.")
+        except Exception as e:
+            print(f"[settings] Could not load {ROI_CONFIG_FILE} ({e}) — "
+                  f"falling back to the default ROI_POINTS.")
+    return np.array(_DEFAULT_ROI_POINTS)
+
+
+ROI_POINTS = _load_roi_points()
+

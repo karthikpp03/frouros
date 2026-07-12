@@ -40,7 +40,7 @@ from config.settings import USE_OPENAI, ENABLE_FACE_RECOGNITION
 from utils.event_logger import log_block
 
 
-def generate_event_summary(smart_frame_paths, event_id):
+def generate_event_summary(smart_frame_paths, event_id, participants=None):
     """
     Args:
         smart_frame_paths: the 3 VideoMAE smart-frame paths for this
@@ -48,6 +48,19 @@ def generate_event_summary(smart_frame_paths, event_id):
                             modified).
         event_id:           the event id, used only for OpenAI's merged
                              image filename.
+        participants:       list[dict] | None — ISSUE 3 (Qwen must
+                             become scene aware). The Scene Event's
+                             COMPLETE participant list (see
+                             prompts.summary_prompts.build_summary_messages()
+                             for the exact shape), forwarded to Qwen so
+                             it describes every participant instead of
+                             just one. Has no effect on the routing
+                             decision itself (still made from
+                             face/recognizer.py's single-face check
+                             below, unchanged) — it only affects what
+                             Qwen is told once Qwen is the branch taken.
+                             OpenAI's own contract already returns a
+                             `persons` list and needs no such change.
 
     Returns:
         (summary, provider, face_result, structured) tuple:
@@ -80,7 +93,7 @@ def generate_event_summary(smart_frame_paths, event_id):
             "Selected Pipeline",
             "Qwen2.5-VL",
         )
-        return _run_qwen(smart_frame_paths), "qwen", None, None
+        return _run_qwen(smart_frame_paths, participants=participants), "qwen", None, None
 
     if not ENABLE_FACE_RECOGNITION:
         # Testing mode — face model isn't wired up yet, so every event
@@ -115,23 +128,26 @@ def generate_event_summary(smart_frame_paths, event_id):
     )
 
     if known:
-        return _run_qwen(smart_frame_paths, person_name=person_name), "qwen", face_result, None
+        return _run_qwen(smart_frame_paths, participants=participants), "qwen", face_result, None
 
     summary, structured = _run_openai(smart_frame_paths, event_id)
     return summary, "openai", face_result, structured
 
 
-def _run_qwen(smart_frame_paths, person_name=None):
+def _run_qwen(smart_frame_paths, participants=None):
     """Local, free, unlimited. Reuses the existing Qwen summary pipeline
-    verbatim — nothing about Qwen's behaviour changes, except that a
-    recognized person's real name (person_name) is now forwarded into
-    the prompt so Qwen names them explicitly instead of saying
-    "the person" / "a person" / "someone" (see prompts/summary_prompts.py)."""
+    verbatim — nothing about Qwen's model/inference changes. ISSUE 3
+    FIX: the Scene Event's COMPLETE participant list is now forwarded
+    into the prompt (instead of a single person_name) so Qwen names
+    every known participant explicitly and every unknown participant
+    "Unknown"/"Unknown visitor N", and describes the whole scene rather
+    than saying "the person" / "a person" / "someone" about just one
+    of them (see prompts/summary_prompts.py)."""
     from pipelines.summary_pipeline import generate_summary
     from config.settings import QWEN_MODEL_ID
 
     log_block("QWEN", "Generating summary...", f"Model : {QWEN_MODEL_ID}", "Waiting for response...")
-    summary = generate_summary(smart_frame_paths, person_name=person_name)
+    summary = generate_summary(smart_frame_paths, participants=participants)
     log_block("QWEN", "Summary generated.")
     return summary
 

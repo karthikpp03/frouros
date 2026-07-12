@@ -75,13 +75,42 @@ def classify_intent(query):
 # PERSON NAME DETECTION  (Task 9 — person-aware retrieval)
 # --------------------------------------------------
 
+def _build_name_pattern(name):
+    """
+    ISSUE 2 — Build a regex that matches a registered person's name
+    (e.g. "test_1") in an operator's question regardless of how they
+    separate its parts. Splits the registered name on its own
+    separators (space/underscore/hyphen), then re-joins the parts with
+    a pattern that accepts any mix of space/underscore/hyphen, or no
+    separator at all, between them — case-insensitively — so all of:
+
+        test_1, test 1, test-1, test1, Test 1, TEST_1, "test 1 person"
+
+    resolve to the single registered name "test_1". Word boundaries at
+    each end stop "test_1" from matching inside an unrelated longer
+    token (e.g. "test_12"), while trailing words like "person" in
+    "test 1 person" are simply left unmatched, which is fine since the
+    pattern isn't anchored to the end of the string.
+    """
+    parts = [p for p in re.split(r"[\s_\-]+", name) if p]
+    if not parts:
+        return None
+    joined = r"[\s_\-]*".join(re.escape(p) for p in parts)
+    return re.compile(rf"\b{joined}\b", re.IGNORECASE)
+
+
 def _detect_person_name(query):
     """
     Detect a registered person's name mentioned in the operator's
-    question (e.g. "Dad", "test_1"), matched as a whole word,
-    case-insensitively, against every name currently registered in
-    SQLite (pipelines.retrieval.get_known_person_names() — populated
-    from face/face_db.py registrations, never a placeholder).
+    question (e.g. "Dad", "test_1"), matched against every name
+    currently registered in SQLite (pipelines.retrieval.
+    get_known_person_names() — populated from face/face_db.py
+    registrations, never a placeholder) — normalized via
+    _build_name_pattern() above so separator/spacing/case variants of
+    a registered name (see ISSUE 2 examples) all resolve to it. This
+    check runs BEFORE every other retrieval branch in
+    _relevant_events_from_db() below, so person-specific retrieval
+    always has the highest priority once a name is recognized.
 
     Returns:
         str | None — the exact stored name (correct casing) if found,
@@ -93,9 +122,9 @@ def _detect_person_name(query):
     if not names:
         return None
 
-    q = query.lower()
     for name in names:
-        if re.search(rf"\b{re.escape(name.lower())}\b", q):
+        pattern = _build_name_pattern(name)
+        if pattern and pattern.search(query):
             return name
     return None
 
@@ -296,8 +325,18 @@ def build_structured_context_from_db(events, query, intents):
             if hour is not None and not _time_matches_query(hour, query):
                 continue
 
+        # ISSUE 2 FIX: `event.event_id` is the ORIGINAL SQLite primary key
+        # for this row, taken directly from the Event object returned by
+        # pipelines/retrieval.py. It is never re-derived from list/loop
+        # position — this loop does not use enumerate() or any other
+        # index-based counter for numbering, specifically so an event
+        # stored as event_id=1 is always rendered as "Event #1" here,
+        # regardless of how many other events were retrieved alongside it
+        # or what position it occupies in `events`.
+        eid = event.event_id
+
         s = (
-            f"[Event #{event.event_id} | {event.start_time} | "
+            f"[Event #{eid} | Date: {event.event_date} | Time: {event.start_time} | "
             f"{event.duration_seconds or 0:.0f}s | provider={event.ai_provider}]\n"
             f"Summary: {event.summary}\n"
         )
@@ -332,6 +371,14 @@ def build_structured_context_from_db(events, query, intents):
             s += "  Vehicles: " + ", ".join(
                 f"{v.color or ''} {v.vehicle_type or ''}".strip() for v in vehicles
             ) + "\n"
+
+        # Keywords were being retrieved (details["keywords"]) but never
+        # rendered into the context Groq actually receives — added here
+        # so Groq always sees the full record for a retrieved event,
+        # matching what ISSUE 3's debug log below prints.
+        kws = details["keywords"]
+        if kws:
+            s += "  Keywords: " + ", ".join(k.keyword for k in kws) + "\n"
 
         parts.append(s)
 
@@ -456,6 +503,19 @@ def query_memory(query, query_embedding=None):
         "=== END OF MEMORY ===\n\n"
         f"Operator question: {query}"
     )
+
+    # ISSUE 3: debug-only visibility into exactly what Groq receives, so
+    # a mismatch between "Retrieved N Events" and what Groq answers can
+    # always be diagnosed from the terminal. Pure logging — no logic
+    # here changes what is sent to Groq, `user_prompt` below is passed
+    # through unmodified.
+    print("=" * 50)
+    print("CONTEXT SENT TO GROQ")
+    print("=" * 50)
+    print(f"Query intent detected: {intent_note}")
+    print(f"Events included: {len(events)}")
+    print(context)
+    print("=" * 50)
 
     output = _llama_infer(LLAMA_SYSTEM_PROMPT, user_prompt, max_new_tokens=300)
     log_block("GROQ", "Answer generated.")

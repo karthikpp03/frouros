@@ -51,7 +51,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 # ── configuration ────────────────────────────────────────────────────────────
 from config.settings import (
-    VIDEO_PATH,
+    VIDEO_PATH, INPUT_MODE, CAMERA_INDEX, RTSP_URL,WEBCAM_DEVICE,
     EVENTS_DIR, SMART_FRAMES_DIR, PERSON_CROPS_DIR, DEBUG_DIR,
     MEMORY_FILE, REID_GALLERY_FILE,
     FRAME_WIDTH, FRAME_HEIGHT,
@@ -177,10 +177,23 @@ bot_thread = start_bot_thread()
 
 # ==============================================================================
 # 5. VIDEO CAPTURE
+# Source is chosen ONLY via INPUT_MODE (config/settings.py / .env) —
+# "video" (VIDEO_PATH), "webcam" (CAMERA_INDEX), or "rtsp" (RTSP_URL).
+# Nothing downstream (ROI, tracking, events, AI) is aware of which one
+# is active; only this capture line changes.
 # ==============================================================================
 
-cap = cv2.VideoCapture(VIDEO_PATH)
-fps = int(cap.get(cv2.CAP_PROP_FPS))
+if INPUT_MODE == "webcam":
+    print(f"[INFO] Input source: webcam ({WEBCAM_DEVICE})")
+    cap = cv2.VideoCapture(WEBCAM_DEVICE)
+elif INPUT_MODE == "rtsp":
+    print(f"[INFO] Input source: RTSP ({RTSP_URL})")
+    cap = cv2.VideoCapture(RTSP_URL)
+else:
+    print(f"[INFO] Input source: video file ({VIDEO_PATH})")
+    cap = cv2.VideoCapture(VIDEO_PATH)
+
+fps = int(cap.get(cv2.CAP_PROP_FPS)) or 20   # webcams/RTSP often report 0
 
 
 # ==============================================================================
@@ -227,17 +240,43 @@ while True:
             x1, y1, x2, y2 = map(int, box)
             area = (x2 - x1) * (y2 - y1)
 
+            print(f"[YOLO] track_id={track_id} conf={confidence:.2f} "
+                  f"box=({x1},{y1},{x2},{y2}) area={area}")
+
             # ── DEBUG REJECTED DETECTIONS ──────────────────────────────────
             if area < MIN_AREA or confidence < MIN_CONFIDENCE:
+                reason = "LOW_CONFIDENCE" if confidence < MIN_CONFIDENCE else "MIN_BOX_SIZE"
+                print(f"    -> REJECTED ({reason})")
                 save_rejected_detection(
                     frame, frame_index, track_id, confidence, area,
                     x1, y1, x2, y2
                 )
                 continue
 
-            cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
-            if not is_inside_roi(cx, cy):
+            # ROI containment must be tested against the person's FEET
+            # (bottom-center of the box), not the box's geometric center.
+            # ROI_POINTS traces a floor-plane polygon (see config/settings.py
+            # / data/roi.json) — it marks out an area of *floor*, not a
+            # region of image-space centered on a standing person's torso.
+            # A standing adult's bbox center sits roughly at chest/waist
+            # height, which is well above the floor-level polygon, so
+            # cv2.pointPolygonTest on the box center fails even when the
+            # person is standing squarely inside the ROI on the ground.
+            # The bottom-center point is where the person actually contacts
+            # the floor, which is what the polygon represents.
+            cx, cy = (x1 + x2) // 2, y2
+            inside = is_inside_roi(cx, cy)
+            print(f"    -> ROI point=({cx},{cy}) inside={inside}")
+            if not inside:
+                print("    -> REJECTED (OUTSIDE_ROI)")
+                save_rejected_detection(
+                    frame, frame_index, track_id, confidence, area,
+                    x1, y1, x2, y2
+                )
                 continue
+
+            print("    -> ACCEPTED")
+
 
             # ── ReID: identify WHO this track_id belongs to (unchanged) ────
             crop = frame[max(0, y1-10):y2+10, max(0, x1-10):x2+10]
@@ -256,8 +295,14 @@ while True:
     # Non-blocking — only opens VideoWriters and updates in-memory trackers.
     # A brand-new Track ID gets a brand-new Event immediately; an existing
     # Track ID just gets its own event fed this frame.
-    if detections_in_roi:
-        event_manager.update_detections(frame, detections_in_roi, fps, now)
+    # NOTE: called every frame, even when detections_in_roi is empty for
+    # THIS specific frame. A momentary missed YOLO detection (occlusion,
+    # motion blur, a confidence dip) does not mean the active Scene Event
+    # has ended — tick()/grace-period logic below is what actually decides
+    # that. If this call is skipped on frames with no detection, the scene
+    # recording silently drops those frames, producing a video with far
+    # fewer frames than the scene's real wall-clock duration.
+    event_manager.update_detections(frame, detections_in_roi, fps, now)
 
     # ── Close any Track ID that left the ROI / timed out. Each event is
     # evaluated and closed independently — closing one never blocks or

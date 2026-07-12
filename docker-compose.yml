@@ -4,8 +4,11 @@ services:
     container_name: frouros-ai
 
     user: "${UID}:${GID}"
+    group_add:
+      - "44"
     env_file:
       - .env
+
     environment:
       HOME: /home/appuser
       TRITON_CACHE_DIR: /tmp/triton
@@ -22,6 +25,13 @@ services:
             - driver: nvidia
               count: all
               capabilities: [gpu]
+
+    # 👇 ADD THIS
+    devices:
+      - /dev/video0:/dev/video0
+      - /dev/video1:/dev/video1
+      - /dev/video2:/dev/video2
+      - /dev/video3:/dev/video3
 
     volumes:
       - .:/app

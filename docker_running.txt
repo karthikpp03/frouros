@@ -1,4 +1,23 @@
-Aama bro 😄. Docker-la **entha file change pannirukka** nu poruththu different commands use pannuvom.
+to train the face models
+
+docker compose up -d
+
+docker compose exec frouros bash
+
+I have no name!@bbec9c6eeb59:/app$ pwd
+/app
+
+I have no name!@bbec9c6eeb59:/app$ python -m face.face_db
+
+[FACE] Loading InsightFace (SCRFD + ArcFace) for registration...
+download_path: /app/data/insightface/models/buffalo_l
+
+
+
+roi setup ku 
+
+host la run pananum python tools/roi_selector.py --video /dev/video0
+
 
 # 1️⃣ Python code mattum change panna (Most Common)
 

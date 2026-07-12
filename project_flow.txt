@@ -1,0 +1,205 @@
+                              FROUROS AI v2
+                     Scene-Based Intelligent CCTV System
+
+                                  LIVE CAMERA
+                         (Video / Webcam / RTSP)
+                                        │
+                                        │
+                                        ▼
+                           Frame Capture (Continuous)
+                                        │
+                                        ▼
+                              YOLO Person Detection
+                                        │
+                                        ▼
+                           Multi Object Tracking (BoT-SORT)
+                                        │
+                                        ▼
+                                ROI Polygon Check
+                                        │
+                   ┌────────────────────┴────────────────────┐
+                   │                                         │
+             ROI Empty                               Person Inside ROI
+                   │                                         │
+            Continue Watching                               ▼
+                                                Scene Manager (Worker 1)
+                                                           │
+                        ┌──────────────────────────────────┼──────────────────────────────────┐
+                        │                                  │                                  │
+                        ▼                                  ▼                                  ▼
+               New Scene?                          Existing Scene?                   Recording Manager
+                        │                                  │                                  │
+                        ▼                                  ▼                                  ▼
+            Create Scene Event                    Join Existing Scene               Record Entire Scene
+                  Event #12                             Event #12                  (One Recording Only)
+                        │                                  │
+                        ▼                                  ▼
+             Face Recognition                     Face Recognition
+                (Only Once)                         (Only Once)
+                        │                                  │
+                        ▼                                  ▼
+           Store Participant Info              Add Participant to Scene
+        (Name, TrackID, Join Time)            (Join Time, TrackID)
+                        │                                  │
+                        └──────────────────┬───────────────┘
+                                           │
+                                           ▼
+                              🚨 Immediate Telegram Alert
+                                           │
+                 ┌─────────────────────────┴─────────────────────────┐
+                 │                                                   │
+                 ▼                                                   ▼
+      🟢 Scene Started                                  ➕ Person Joined
+      Event #12                                         Event #12
+      Dad                                               Mom Joined
+                                                        Unknown Joined
+                 │
+                 ▼
+          Continue Monitoring Camera
+                 │
+                 ▼
+       People Enter / Leave Freely
+                 │
+                 ▼
+      ROI Still Occupied?
+          │             │
+         YES           NO
+          │             │
+          │             ▼
+          │      Stop Recording
+          │             │
+          │             ▼
+          │     Push Scene To AI Queue
+          │
+          └────────────► Continue Monitoring Camera
+
+
+=====================================================================
+
+                     AI PROCESSING (Worker 2)
+
+                        Scene Event Queue
+                               │
+                               ▼
+                    Pop Oldest Scene Event
+                               │
+                               ▼
+                  Load Complete Recording
+                               │
+                               ▼
+                         VideoMAE
+                  Select Best 3 Smart Frames
+                               │
+                               ▼
+                    Load Participants Timeline
+                               │
+                               ▼
+                         AI Router
+                               │
+             ┌─────────────────┴──────────────────┐
+             │                                    │
+             ▼                                    ▼
+    All Persons Known                    Unknown Exists
+             │                                    │
+             ▼                                    ▼
+          Qwen VL                          OpenAI Vision
+             │                                    │
+             └─────────────────┬──────────────────┘
+                               │
+                               ▼
+               Generate One Complete Scene Summary
+                               │
+                               ▼
+                    Structured CCTV Information
+                 • Participants
+                 • Join / Leave Timeline
+                 • Actions
+                 • Objects
+                 • Vehicles
+                 • Keywords
+                 • Final Summary
+                               │
+                               ▼
+                       Update SQLite Database
+                               │
+                               ▼
+                  📩 Telegram AI Summary Report
+                               │
+                               ▼
+                      Process Next Scene Event
+
+
+=====================================================================
+
+                      TELEGRAM USER QUERIES
+
+               User → "When did Dad come?"
+                               │
+                               ▼
+                     Query Pipeline + Retrieval
+                               │
+                               ▼
+                         SQLite Search
+                               │
+                               ▼
+                            Groq LLM
+                               │
+                               ▼
+                 Human-like Answer to Telegram
+
+
+=====================================================================
+
+                       SQLITE DATABASE
+
+Scene Event
+    │
+    ├── Event ID
+    ├── Start Time
+    ├── End Time
+    ├── Recording Path
+    ├── AI Provider
+    ├── Summary
+    │
+    ├── Participants
+    │      ├── Dad
+    │      │      ├── Join Time
+    │      │      ├── Leave Time
+    │      │      └── Track ID
+    │      │
+    │      ├── Mom
+    │      └── Unknown
+    │
+    ├── Actions
+    ├── Objects
+    ├── Vehicles
+    ├── Keywords
+    └── Smart Frames
+
+
+=====================================================================
+
+                    RESPONSIBILITY SPLIT
+
+Worker 1 (Real-Time)
+────────────────────────────────────────────
+✓ Capture Frames
+✓ YOLO Detection
+✓ Tracking
+✓ ROI Monitoring
+✓ Scene Management
+✓ Face Recognition (Once)
+✓ Recording
+✓ Telegram Instant Alerts
+
+Worker 2 (Background AI)
+────────────────────────────────────────────
+✓ VideoMAE
+✓ Router
+✓ Qwen/OpenAI
+✓ Structured Data
+✓ SQLite Update
+✓ Telegram AI Summary
+
+Both workers run independently.
+Worker 1 NEVER waits for Worker 2.
