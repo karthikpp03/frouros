@@ -204,3 +204,28 @@ docker compose up
 | Docker cache issue   | ✅ Clean Build   | `docker compose down && docker compose build --no-cache && docker compose up` |
 
 This is the workflow I recommend for your project. Most days you'll only need a simple restart after changing Python code, and only rebuild when dependencies or the Docker image itself changes.
+
+
+
+
+Super da. Appo CPU-ku separate compose maintain panrathu than best practice. 👍
+
+Assuming file name:
+
+docker-compose.cpu.yml
+
+Run:
+
+docker compose -f docker-compose.cpu.yml up --build
+
+Background-la:
+
+docker compose -f docker-compose.cpu.yml up -d --build
+
+Container-kulla poga:
+
+docker compose -f docker-compose.cpu.yml exec frouros bash
+
+Stop panna:
+
+docker compose -f docker-compose.cpu.yml down
