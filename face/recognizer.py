@@ -218,6 +218,13 @@ def detect_faces(image):
             "embedding": f.normed_embedding,
             "bbox":      (float(x1), float(y1), float(x2), float(y2)),
             "area":      float((x2 - x1) * (y2 - y1)),
+            # SCRFD's own detection confidence — additive field, used by
+            # models/videomae.py's Smart Frame face-visibility scoring
+            # to prefer a clear frontal face over a barely-detected
+            # partial/profile one. Falls back to 1.0 if a given
+            # InsightFace version doesn't expose it, so existing
+            # callers that only read embedding/bbox/area are unaffected.
+            "det_score": float(getattr(f, "det_score", 1.0)),
         })
     return faces
 

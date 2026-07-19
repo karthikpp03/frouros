@@ -73,10 +73,51 @@ the thing that picks the winner. VideoMAE's saliency score is what
 picks the winner among valid candidates. This preserves the "avoid
 empty frames" requirement without reintroducing a handcrafted ranking
 algorithm as the actual decision-maker.
+
+ISSUE 1 ROOT CAUSE (this revision) — why back/blurry/empty frames
+still won even with full-event coverage
+------------------------------------------------------------------
+Investigation (see the task's 10-point checklist) confirmed items 1-8
+were already correct as of the previous revision above: VideoMAE does
+see the whole event, clips are contiguous and cover every frame,
+embeddings are converted into a real per-tubelet score, indices map
+back to the correct original frame (`tubelet_frame_idx` always indexes
+into the SAME `raw_frames` list the clips were sliced from — no
+cross-clip index mismatch), and timestamps derive from those same
+frame indices.
+
+Items 9-10 were the actual root cause: **face visibility and blur
+were never part of the score at all.** `_temporal_saliency()` only
+measures how far a tubelet's embedding sits from the event's OWN mean
+embedding — "how different does this instant look from the rest of
+this event". That is a pure *novelty* signal, not a *quality* signal,
+and the two are frequently anti-correlated in CCTV footage: the moment
+someone turns their back to leave, or a motion-blurred transition
+between two poses, is often the MOST different-looking instant in the
+whole clip precisely because it's a brief transient — so it can
+out-score a longer, static, front-facing stretch that looks similar
+frame to frame. The `quality_scores` validity gate didn't fix this
+either, since it only measures "YOLO found a confident person-shaped
+box here" (`area * confidence`) — a back view or a blurry frame with a
+big, confident detection box passes that gate just fine.
+
+Fix: `_select_indices()` below now combines THREE signals per
+candidate instead of one — VideoMAE's saliency (representativeness), a
+Laplacian-variance sharpness score (`_blur_score()`), and a face-
+visibility score from the already-loaded InsightFace detector
+(`_face_score()`, reusing face/recognizer.py — no second model, no
+extra load) — so a sharp, front-facing candidate is preferred over a
+"novel-looking" but back-turned or blurry one, while VideoMAE's own
+representation still participates in the decision (per the task's
+requirement to "still utilize VideoMAE where appropriate"). Blur/face
+scoring runs only on a small saliency-ranked shortlist per third (not
+every candidate) to keep this cheap.
 """
 
 import os
 import gc
+import csv
+import time
 import cv2
 import torch
 import numpy as np
@@ -152,17 +193,85 @@ def unload_videomae():
     log_gpu_memory("After VideoMAE unload")
 
 
-def extract_smart_frames(video_path_arg, ev_id, quality_scores=None):
+def extract_smart_frames_fallback(video_path_arg, ev_id, quality_scores=None, debug=None):
+    """
+    Public entrypoint used ONLY when VideoMAE itself failed to LOAD for
+    this event (see ISSUE 2 / pipelines/event_manager.py, which calls
+    this instead of extract_smart_frames() whenever
+    model_manager.safe_load("videomae", load_videomae) returns False).
+
+    Does the same frame-decode + 3-frame-per-thirds selection as
+    extract_smart_frames(), but scores candidates with sharpness +
+    the detection-quality gate only (see _fallback_select()) since no
+    VideoMAE embedding is available at all. Smart Frame Selection
+    degrades gracefully instead of the whole event failing outright.
+    """
+    log_block("VideoMAE", "VideoMAE unavailable — using fallback frame selection...")
+    event_folder = f"{SMART_FRAMES_DIR}/event_{ev_id}"
+    os.makedirs(event_folder, exist_ok=True)
+
+    cap_local  = cv2.VideoCapture(video_path_arg)
+    fps        = cap_local.get(cv2.CAP_PROP_FPS) or 0.0
+    if fps <= 0:
+        fps = 15.0
+    raw_frames = []
+
+    while True:
+        ret, frame = cap_local.read()
+        if not ret:
+            break
+        raw_frames.append(frame.copy())
+    cap_local.release()
+
+    total_frames = len(raw_frames)
+    if debug is not None:
+        debug.save_all_frames(raw_frames)
+        debug.save_original_video(video_path_arg)
+        debug.log(f"[INFO]\nDecoded {total_frames} frames at {fps:.2f} fps "
+                   f"(VideoMAE unavailable this event).")
+
+    if total_frames == 0:
+        print("[WARNING] Not enough frames")
+        return []
+
+    indices, score_rows = _fallback_select(total_frames, raw_frames, quality_scores)
+
+    selected_frames = []
+    mapping_rows = []
+    for order, idx in enumerate(indices, start=1):
+        frame_path = f"{event_folder}/{order:02d}.jpg"
+        cv2.imwrite(frame_path, raw_frames[idx])
+        selected_frames.append(frame_path)
+        mapping_rows.append({
+            "order": order,
+            "frame_index": idx,
+            "timestamp_sec": round(idx / fps, 3),
+            "output_path": frame_path,
+        })
+
+    if debug is not None:
+        selected_set = set(indices)
+        for row in score_rows:
+            row["selected"] = 1 if row.get("frame_index") in selected_set else 0
+            row.setdefault("timestamp_sec", round(row.get("frame_index", 0) / fps, 3))
+        debug.write_videomae_scores(score_rows)
+        debug.write_frame_mapping(mapping_rows)
+        debug.save_selected_frames(selected_frames)
+
+    log_block("VideoMAE", f"Selected (fallback) : {len(selected_frames)} frames")
+    return selected_frames
+
+
+def extract_smart_frames(video_path_arg, ev_id, quality_scores=None, debug=None):
     """
     Extract smart frames from a recorded event video using VideoMAE.
 
-    VideoMAE now analyzes the COMPLETE recording — every decoded frame
-    is covered by at least one contiguous clip run through the model
-    (see _split_into_clips()) — and its own output decides WHICH 3 raw
-    frames are the final "smart frames" (see _temporal_embeddings()/
-    _temporal_saliency()/_select_indices() below), instead of running
-    a forward pass on one sampled clip whose output is thrown away in
-    favour of a separate handcrafted heuristic.
+    VideoMAE analyzes the COMPLETE recording — every decoded frame is
+    covered by at least one contiguous clip run through the model (see
+    _split_into_clips()) — and the final winners are chosen by
+    combining VideoMAE's own saliency score with sharpness and face-
+    visibility (see _select_indices()), instead of a single novelty-
+    only signal or a discarded embedding.
 
     Args:
         video_path_arg: path to the finished scene recording.
@@ -174,9 +283,12 @@ def extract_smart_frames(video_path_arg, ev_id, quality_scores=None):
             capture by pipelines/event_manager.py (SceneEvent.
             frame_quality) — no extra inference here. Used ONLY as a
             validity gate (skip a frame with no confirmed detection at
-            all) — VideoMAE's own saliency score below is what picks
-            the winner among valid candidates. When omitted, absent,
-            or mismatched in length, every frame is treated as valid.
+            all) — the combined score below is what picks the winner
+            among valid candidates. When omitted, absent, or
+            mismatched in length, every frame is treated as valid.
+        debug: optional utils.debug_artifacts.EventDebug instance. When
+            given, this call writes videomae_scores.csv, frame_mapping.csv,
+            all_frames/, and selected_frames/ for this event.
     """
     if videomae_model is None or videomae_processor is None:
         raise RuntimeError(
@@ -190,6 +302,9 @@ def extract_smart_frames(video_path_arg, ev_id, quality_scores=None):
     os.makedirs(event_folder, exist_ok=True)
 
     cap_local  = cv2.VideoCapture(video_path_arg)
+    fps        = cap_local.get(cv2.CAP_PROP_FPS) or 0.0
+    if fps <= 0:
+        fps = 15.0  # sane default when the container doesn't report one
     raw_frames = []
 
     while True:
@@ -201,10 +316,19 @@ def extract_smart_frames(video_path_arg, ev_id, quality_scores=None):
     cap_local.release()
 
     total_frames = len(raw_frames)
+    if debug is not None:
+        debug.save_all_frames(raw_frames)
+        debug.save_original_video(video_path_arg)
+        debug.log(f"[INFO]\nDecoded {total_frames} frames at {fps:.2f} fps.")
+
     if total_frames < _NUM_MODEL_FRAMES:
         print("[WARNING] Not enough frames")
+        if debug is not None:
+            debug.log("[WARNING]\nNot enough frames for VideoMAE (need at "
+                       f"least {_NUM_MODEL_FRAMES}, got {total_frames}).")
         return []
 
+    score_rows = []
     try:
         # Run VideoMAE on the COMPLETE event — every contiguous clip,
         # covering every decoded frame — instead of one sampled clip,
@@ -232,23 +356,48 @@ def extract_smart_frames(video_path_arg, ev_id, quality_scores=None):
         # recording rather than just whichever single clip was sampled.
         combined_embeds = torch.cat(all_embeds, dim=0)
         saliency = _temporal_saliency(combined_embeds)
-        indices = _select_indices(
-            total_frames, all_frame_idx, saliency, quality_scores
+        indices, score_rows = _select_indices(
+            total_frames, all_frame_idx, saliency, quality_scores, raw_frames
         )
+        if debug is not None:
+            debug.log(f"[SUCCESS]\nVideoMAE scored {len(all_frame_idx)} "
+                       f"tubelets across {len(clips)} clips.")
     except Exception as e:
         # Defensive fallback — a shape mismatch (e.g. a differently
         # configured VideoMAE checkpoint) must never crash event
-        # finalisation. Falls back to an evenly-spaced selection rather
-        # than the old discarded-embedding behaviour.
+        # finalisation. Falls back to a blur/quality-only selection
+        # (see _fallback_select()) rather than the old discarded-
+        # embedding behaviour.
         print(f"[WARNING] VideoMAE-driven frame selection failed ({e}); "
-              f"falling back to evenly-spaced frames.")
-        indices = list(np.linspace(0, total_frames - 1, 3, dtype=int))
+              f"falling back to blur/quality-only selection.")
+        if debug is not None:
+            debug.log(f"[ERROR]\nVideoMAE-driven frame selection failed.\n"
+                       f"Reason:\n{type(e).__name__}: {e}")
+        indices, score_rows = _fallback_select(total_frames, raw_frames, quality_scores)
 
     selected_frames = []
+    mapping_rows = []
     for order, idx in enumerate(indices, start=1):
         frame_path = f"{event_folder}/{order:02d}.jpg"
         cv2.imwrite(frame_path, raw_frames[idx])
         selected_frames.append(frame_path)
+        mapping_rows.append({
+            "order": order,
+            "frame_index": idx,
+            "timestamp_sec": round(idx / fps, 3),
+            "output_path": frame_path,
+        })
+
+    if debug is not None:
+        selected_set = set(indices)
+        for row in score_rows:
+            row["selected"] = 1 if row.get("frame_index") in selected_set else 0
+            row.setdefault("timestamp_sec", round(row.get("frame_index", 0) / fps, 3))
+        debug.write_videomae_scores(score_rows)
+        debug.write_frame_mapping(mapping_rows)
+        debug.save_selected_frames(selected_frames)
+        debug.log(f"[SUCCESS]\nSelected {len(selected_frames)} Smart Frames: "
+                   f"{[r['frame_index'] for r in mapping_rows]}")
 
     log_block("VideoMAE", f"Selected : {len(selected_frames)} frames")
     return selected_frames
@@ -355,17 +504,92 @@ def _temporal_saliency(tubelet_embeds):
     return torch.norm(tubelet_embeds - mean_embed, dim=1).cpu().numpy()
 
 
-def _select_indices(total_frames, tubelet_frame_idx, saliency, quality_scores):
+# How many saliency-ranked candidates per third get the (more
+# expensive) blur + face-detection scoring. Keeps the extra cost
+# bounded regardless of how long an event runs, instead of scoring
+# every tubelet in the whole recording.
+_SHORTLIST_SIZE = 6
+
+# Below this Laplacian-variance value a frame is considered too
+# blurry/motion-smeared to be a good representative frame, unless
+# every shortlisted candidate in that third is equally blurry (in
+# which case there's nothing better to fall back to).
+_MIN_SHARPNESS = 40.0
+
+
+def _blur_score(frame) -> float:
+    """
+    Laplacian-variance sharpness score — the standard, cheap
+    "how in-focus is this frame" measure. Higher = sharper. A frame
+    with heavy motion blur or an out-of-focus subject scores low here
+    even if VideoMAE's saliency score liked that instant.
+    """
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    return float(cv2.Laplacian(gray, cv2.CV_64F).var())
+
+
+def _face_score(frame) -> float:
+    """
+    Face-visibility score for one candidate frame — reuses the SAME
+    already-loaded InsightFace detector as face/recognizer.py (no
+    second model, no extra load; returns 0.0 immediately if face
+    recognition is disabled or not yet loaded, per detect_faces()'s
+    own contract). Combines the largest detected face's area (bigger,
+    closer face = more useful) with SCRFD's own detection confidence
+    (`det_score`) so a clear frontal face outscores a barely-detected
+    sliver of a profile. 0.0 whenever no face is visible at all —
+    e.g. a back view.
+    """
+    try:
+        from face.recognizer import detect_faces
+        faces = detect_faces(frame)
+    except Exception:
+        return 0.0
+
+    if not faces:
+        return 0.0
+
+    best = max(faces, key=lambda f: f["area"] * f.get("det_score", 1.0))
+    return float(best["area"] * best.get("det_score", 1.0))
+
+
+def _normalize(values):
+    """Min-max normalize to [0, 1]; a constant (or empty) list maps to
+    all-zeros rather than dividing by zero."""
+    if not values:
+        return []
+    lo, hi = min(values), max(values)
+    if hi - lo < 1e-9:
+        return [0.0 for _ in values]
+    return [(v - lo) / (hi - lo) for v in values]
+
+
+def _select_indices(total_frames, tubelet_frame_idx, saliency, quality_scores, raw_frames):
     """
     Pick 3 raw-frame indices — one each from the first / middle / last
     third of the event, to keep the "entering, main interaction,
-    leaving" temporal spread — using VideoMAE's own saliency score
-    (see _temporal_saliency()) to choose the winner within each third.
+    leaving" temporal spread.
 
-    `quality_scores`, when available, is used ONLY to skip a candidate
-    tubelet whose centre frame has no confirmed detection at all (an
-    empty/grace-period gap) — never to rank or override VideoMAE's own
-    saliency score, which is what actually decides the winner.
+    Within each third, the winner is chosen by a WEIGHTED COMBINATION
+    of three signals (see the module docstring's "ISSUE 1 ROOT CAUSE"
+    section for why saliency alone picked back/blurry frames):
+
+      - VideoMAE's saliency score (_temporal_saliency())   — representativeness
+      - Sharpness (_blur_score())                           — is it in focus
+      - Face visibility (_face_score())                     — is a face visible
+
+    To keep this cheap on a long event, blur/face are only computed
+    for the top `_SHORTLIST_SIZE` saliency-ranked candidates in each
+    third, not every tubelet. `quality_scores`, when available, is
+    still used first as the validity gate (skip a candidate with no
+    confirmed detection at all).
+
+    Returns:
+        (indices, score_rows) — `indices` is the 3 chosen raw-frame
+        indices; `score_rows` is a list[dict] (one row per candidate
+        that was scored) suitable for utils.debug_artifacts.
+        EventDebug.write_videomae_scores() — used for debugging, not
+        by the selection logic itself.
     """
     fallback = list(np.linspace(0, total_frames - 1, 3, dtype=int))
     valid_quality = (
@@ -374,6 +598,7 @@ def _select_indices(total_frames, tubelet_frame_idx, saliency, quality_scores):
 
     bounds = [0, total_frames // 3, (2 * total_frames) // 3, total_frames]
     indices = []
+    score_rows = []
 
     for b in range(3):
         lo, hi = bounds[b], bounds[b + 1]
@@ -385,19 +610,110 @@ def _select_indices(total_frames, tubelet_frame_idx, saliency, quality_scores):
         candidates = [
             t for t, f in enumerate(tubelet_frame_idx) if lo <= f < hi
         ]
+        gated_out = []
         if valid_quality:
             with_detection = [
                 t for t in candidates if quality_scores[tubelet_frame_idx[t]] > 0
             ]
             if with_detection:
+                gated_out = [t for t in candidates if t not in with_detection]
                 candidates = with_detection
+
+        # Record the frames that were gated out purely for the debug
+        # trail (quality_gate=0, never scored further).
+        for t in gated_out:
+            score_rows.append({
+                "frame_index": tubelet_frame_idx[t],
+                "saliency": float(saliency[t]),
+                "quality_gate": 0,
+            })
 
         if not candidates:
             indices.append(fallback[b])
             continue
 
-        # VideoMAE's own saliency score picks the winner.
-        best_t = max(candidates, key=lambda t: saliency[t])
-        indices.append(tubelet_frame_idx[best_t])
+        # Shortlist by VideoMAE saliency first — keeps blur/face
+        # scoring bounded regardless of event length.
+        shortlist = sorted(candidates, key=lambda t: saliency[t], reverse=True)[:_SHORTLIST_SIZE]
 
-    return indices
+        blur_vals = [_blur_score(raw_frames[tubelet_frame_idx[t]]) for t in shortlist]
+        face_vals = [_face_score(raw_frames[tubelet_frame_idx[t]]) for t in shortlist]
+        saliency_vals = [float(saliency[t]) for t in shortlist]
+
+        norm_saliency = _normalize(saliency_vals)
+        norm_blur     = _normalize(blur_vals)
+        norm_face     = _normalize(face_vals)
+
+        has_face_signal = max(face_vals) > 0.0
+
+        combined = []
+        for i in range(len(shortlist)):
+            if has_face_signal:
+                score = 0.45 * norm_face[i] + 0.40 * norm_saliency[i] + 0.15 * norm_blur[i]
+            else:
+                # Face recognition disabled, or nobody's face visible
+                # anywhere in this third — fall back to saliency+blur.
+                score = 0.6 * norm_saliency[i] + 0.4 * norm_blur[i]
+
+            # Hard-deprioritize genuinely blurry candidates unless
+            # every option in the shortlist is equally blurry.
+            if blur_vals[i] < _MIN_SHARPNESS and max(blur_vals) >= _MIN_SHARPNESS:
+                score *= 0.1
+
+            combined.append(score)
+            score_rows.append({
+                "frame_index": tubelet_frame_idx[shortlist[i]],
+                "saliency": saliency_vals[i],
+                "blur": blur_vals[i],
+                "face_score": face_vals[i],
+                "quality_gate": 1,
+                "combined_score": round(score, 6),
+            })
+
+        best_i = max(range(len(shortlist)), key=lambda i: combined[i])
+        indices.append(tubelet_frame_idx[shortlist[best_i]])
+
+    return indices, score_rows
+
+
+def _fallback_select(total_frames, raw_frames, quality_scores):
+    """
+    Used ONLY when VideoMAE itself is unavailable for this event (see
+    ISSUE 2 — models/model_manager.py) or its forward pass raised.
+    Picks one frame per first/middle/last third using JUST sharpness
+    + the detection-quality gate (no VideoMAE saliency term, since
+    VideoMAE didn't run) — still far better than a blind evenly-spaced
+    pick, and still avoids empty/no-detection frames.
+    """
+    valid_quality = (
+        quality_scores is not None and len(quality_scores) == total_frames
+    )
+    bounds = [0, total_frames // 3, (2 * total_frames) // 3, total_frames]
+    indices = []
+    score_rows = []
+
+    for b in range(3):
+        lo, hi = bounds[b], bounds[b + 1]
+        if hi <= lo:
+            indices.append(min(max(lo, 0), total_frames - 1))
+            continue
+
+        candidates = list(range(lo, hi))
+        if valid_quality:
+            with_detection = [i for i in candidates if quality_scores[i] > 0]
+            if with_detection:
+                candidates = with_detection
+
+        blur_vals = [_blur_score(raw_frames[i]) for i in candidates]
+        for i, idx in enumerate(candidates):
+            score_rows.append({
+                "frame_index": idx,
+                "blur": blur_vals[i],
+                "quality_gate": 1,
+                "combined_score": blur_vals[i],
+            })
+
+        best_i = max(range(len(candidates)), key=lambda i: blur_vals[i])
+        indices.append(candidates[best_i])
+
+    return indices, score_rows

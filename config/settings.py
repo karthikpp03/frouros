@@ -92,6 +92,13 @@ SMART_FRAMES_DIR  = os.path.join(DATA_DIR, "smart_frames")
 PERSON_CROPS_DIR  = os.path.join(DATA_DIR, "person_crops")
 DEBUG_DIR         = os.path.join(DATA_DIR, "debug_rejected")
 
+# Per-event debugging artifacts (Smart Frame Selection + AI-processing
+# audit trail) — see utils/debug_artifacts.py. One subfolder per event:
+#   debug/event_<id>/{original_video.mp4, all_frames/, selected_frames/,
+#                      videomae_scores.csv, frame_mapping.csv,
+#                      processing_log.txt}
+DEBUG_EVENTS_DIR  = os.path.join(DATA_DIR, "debug")
+
 MEMORY_FILE       = os.path.join(DATA_DIR, "event_memory.json")
 REID_GALLERY_FILE = os.path.join(DATA_DIR, "reid_gallery.json")
 

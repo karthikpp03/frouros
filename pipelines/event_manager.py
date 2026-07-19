@@ -88,8 +88,13 @@ from config.settings import (
 )
 from memory.event_memory        import empty_event_record, empty_person_record, save_memory_append
 from memory.gallery              import gallery_was_recent, gallery_purge_stale, gallery_save
-from models.videomae              import extract_smart_frames, load_videomae, unload_videomae
+from models.videomae              import (
+    extract_smart_frames, load_videomae, unload_videomae,
+    extract_smart_frames_fallback,
+)
 from models.qwen_vl                import load_qwen, unload_qwen
+from models                        import model_manager
+from utils.debug_artifacts        import EventDebug
 #from models.smolvlm               import load_qwen, unload_qwen
 from pipelines.summary_pipeline  import extract_person_attributes
 from telegram.alerts             import (
@@ -795,24 +800,56 @@ class EventManager:
         if not write_ok:
             print(f"[WARNING] Snapshot write failed for Scene Event {ev_id}")
 
+        # DEBUGGING REQUIREMENTS — one debug/event_<id>/ folder per
+        # event (original_video.mp4, all_frames/, selected_frames/,
+        # videomae_scores.csv, frame_mapping.csv, processing_log.txt).
+        # Every write in here is best-effort — see utils/debug_artifacts.py
+        # — a debug-write failure must never affect real processing.
+        debug = EventDebug(ev_id)
+        debug.log(f"[INFO]\nStarting AI processing for Scene Event {ev_id} "
+                   f"(duration ~{ev_duration}s, {len(participants)} participant(s)).")
+
         # STEP 2: VideoMAE — sparse "smart frame" selection over the
         # ENTIRE scene recording (every participant included), fully
         # loaded/used/released here — Worker 2 never touches VideoMAE
-        # outside this window. VideoMAE's own output (not a handcrafted
-        # frame-quality/Laplacian heuristic) now drives WHICH 3 frames
-        # get selected — see models/videomae.py. `frame_quality`
+        # outside this window. The combined score (see models/videomae.py)
+        # now drives WHICH 3 frames get selected — `frame_quality`
         # (index-aligned per-frame scores computed for free during
         # capture — see SceneEvent.write_frame()/update_detections())
         # is still passed through, but only as a validity gate (skip a
         # frame with no confirmed detection at all), never as the thing
         # that picks the winner.
-        load_videomae()
-        smart_frames = extract_smart_frames(
-            ev_output, ev_id, quality_scores=job.get("frame_quality")
-        )
-        unload_videomae()
-        gc.collect()
-        empty_cache()
+        #
+        # ISSUE 2 — ROBUST MODEL LOADING: VideoMAE is loaded through
+        # model_manager.safe_load(), which NEVER raises — a failed load
+        # (model not found, corrupt checkpoint, OOM, ...) is logged in
+        # full and marked FAILED, and Smart Frame Selection falls back
+        # to extract_smart_frames_fallback() (sharpness + detection-
+        # quality only, no VideoMAE) instead of taking down Face
+        # Recognition / AI Summary / the Telegram alert for this event.
+        videomae_ready = model_manager.safe_load("videomae", load_videomae)
+        try:
+            if videomae_ready:
+                smart_frames = model_manager.run_stage(
+                    "videomae_extract",
+                    extract_smart_frames,
+                    ev_output, ev_id,
+                    quality_scores=job.get("frame_quality"), debug=debug,
+                    fallback=lambda: extract_smart_frames_fallback(
+                        ev_output, ev_id,
+                        quality_scores=job.get("frame_quality"), debug=debug,
+                    ),
+                )
+            else:
+                smart_frames = extract_smart_frames_fallback(
+                    ev_output, ev_id,
+                    quality_scores=job.get("frame_quality"), debug=debug,
+                )
+        finally:
+            if videomae_ready:
+                model_manager.safe_unload("videomae", unload_videomae)
+            gc.collect()
+            empty_cache()
 
         # STEP 2.5 (ISSUE 1 — Face Recognition must use the best Smart
         # Frame): Worker 1 (Stage 1) never attempts Face Recognition at
@@ -835,69 +872,83 @@ class EventManager:
         # the clearer Smart Frame face, never on the anchor crop
         # itself, whenever a Smart Frame face is available.
         face_recognition_active = USE_OPENAI and ENABLE_FACE_RECOGNITION
+        # ISSUE 2 — this ENTIRE stage is wrapped so any failure here
+        # (InsightFace not loaded, a corrupt face database, an
+        # unexpected detector error, ...) is logged in full and simply
+        # leaves participants unresolved (p.name stays None), instead
+        # of crashing _process_ai() and losing AI Summary + the
+        # Telegram alert for the whole event.
         if face_recognition_active:
-            from face.recognizer import has_usable_face, detect_faces, match_embedding
+            try:
+                from face.recognizer import has_usable_face, detect_faces, match_embedding
 
-            unresolved = [p for p in participants if p.name is None]
+                unresolved = [p for p in participants if p.name is None]
 
-            # Face Detection on every selected Smart Frame, ONCE per
-            # event (not once per participant) — every face InsightFace
-            # finds across the 3 VideoMAE Smart Frames, pooled together.
-            smart_face_candidates = []
-            for frame_path in smart_frames:
-                smart_face_candidates.extend(detect_faces(frame_path))
+                # Face Detection on every selected Smart Frame, ONCE per
+                # event (not once per participant) — every face InsightFace
+                # finds across the 3 VideoMAE Smart Frames, pooled together.
+                smart_face_candidates = []
+                for frame_path in smart_frames:
+                    smart_face_candidates.extend(detect_faces(frame_path))
 
-            for p in unresolved:
-                # Identity ANCHOR: this participant's own best_crop,
-                # used only to tell THEM apart from other participants
-                # in the same Smart Frames — never used for the final
-                # recognition call when a Smart Frame face is found.
-                anchor_embedding = None
-                crop = p.best_crop
-                if crop is not None and crop.size and has_usable_face(crop):
-                    anchor_faces = detect_faces(crop)
-                    if anchor_faces:
-                        anchor_embedding = max(anchor_faces, key=lambda f: f["area"])["embedding"]
+                for p in unresolved:
+                    # Identity ANCHOR: this participant's own best_crop,
+                    # used only to tell THEM apart from other participants
+                    # in the same Smart Frames — never used for the final
+                    # recognition call when a Smart Frame face is found.
+                    anchor_embedding = None
+                    crop = p.best_crop
+                    if crop is not None and crop.size and has_usable_face(crop):
+                        anchor_faces = detect_faces(crop)
+                        if anchor_faces:
+                            anchor_embedding = max(anchor_faces, key=lambda f: f["area"])["embedding"]
 
-                chosen = None
-                if smart_face_candidates:
-                    if anchor_embedding is not None:
-                        # The Smart Frame face that is the SAME physical
-                        # person as this participant's anchor (highest
-                        # embedding similarity) — "the clearest visible
-                        # face" for THIS participant specifically.
-                        best_i, best_sim = None, -1.0
-                        for i, cand in enumerate(smart_face_candidates):
-                            sim = float(np.dot(anchor_embedding, cand["embedding"]))
-                            if sim > best_sim:
-                                best_i, best_sim = i, sim
-                        chosen = smart_face_candidates.pop(best_i)
-                    elif len(unresolved) == 1:
-                        # Only one unresolved participant and no usable
-                        # anchor (their best_crop never showed a face at
-                        # all) — unambiguous: the single largest
-                        # remaining Smart Frame face must be them.
-                        best_i = max(
-                            range(len(smart_face_candidates)),
-                            key=lambda i: smart_face_candidates[i]["area"],
-                        )
-                        chosen = smart_face_candidates.pop(best_i)
+                    chosen = None
+                    if smart_face_candidates:
+                        if anchor_embedding is not None:
+                            # The Smart Frame face that is the SAME physical
+                            # person as this participant's anchor (highest
+                            # embedding similarity) — "the clearest visible
+                            # face" for THIS participant specifically.
+                            best_i, best_sim = None, -1.0
+                            for i, cand in enumerate(smart_face_candidates):
+                                sim = float(np.dot(anchor_embedding, cand["embedding"]))
+                                if sim > best_sim:
+                                    best_i, best_sim = i, sim
+                            chosen = smart_face_candidates.pop(best_i)
+                        elif len(unresolved) == 1:
+                            # Only one unresolved participant and no usable
+                            # anchor (their best_crop never showed a face at
+                            # all) — unambiguous: the single largest
+                            # remaining Smart Frame face must be them.
+                            best_i = max(
+                                range(len(smart_face_candidates)),
+                                key=lambda i: smart_face_candidates[i]["area"],
+                            )
+                            chosen = smart_face_candidates.pop(best_i)
 
-                if chosen is not None:
-                    name, conf = match_embedding(chosen["embedding"])
-                elif anchor_embedding is not None:
-                    # No Smart Frame face available/left to match this
-                    # participant to (e.g. they had already left before
-                    # any Smart Frame was captured) — fall back to
-                    # their own best_crop rather than reporting nothing.
-                    name, conf = match_embedding(anchor_embedding)
-                else:
-                    continue
+                    if chosen is not None:
+                        name, conf = match_embedding(chosen["embedding"])
+                    elif anchor_embedding is not None:
+                        # No Smart Frame face available/left to match this
+                        # participant to (e.g. they had already left before
+                        # any Smart Frame was captured) — fall back to
+                        # their own best_crop rather than reporting nothing.
+                        name, conf = match_embedding(anchor_embedding)
+                    else:
+                        continue
 
-                if name not in (None, "Unknown"):
-                    p.name, p.confidence = name, conf
-                    print(f"[EventManager] Scene {ev_id} person{p.person_index} "
-                          f"identified as {name} from Smart Frame.")
+                    if name not in (None, "Unknown"):
+                        p.name, p.confidence = name, conf
+                        print(f"[EventManager] Scene {ev_id} person{p.person_index} "
+                              f"identified as {name} from Smart Frame.")
+            except Exception as e:
+                model_manager.mark_failed("face_recognition", e)
+                print(f"[ERROR]\nFace Recognition failed for event {ev_id}.\n"
+                      f"Reason:\n{type(e).__name__}: {e}")
+                debug.log(f"[ERROR]\nFace Recognition failed.\nReason:\n{type(e).__name__}: {e}")
+                # Participants simply stay unresolved (name=None) —
+                # AI Summary/Telegram/DB below still proceed normally.
 
         # ISSUE 3 — Qwen must become scene aware: the COMPLETE
         # participant list (every known real name, every unrecognized
@@ -931,10 +982,21 @@ class EventManager:
         # USE_OPENAI=True and ENABLE_FACE_RECOGNITION=False.
         qwen_may_run = (not USE_OPENAI) or ENABLE_FACE_RECOGNITION
         if qwen_may_run:
-            load_qwen()
+            # ISSUE 2: a Qwen load failure is logged and marked FAILED
+            # but never raises — generate_event_summary() below is
+            # still attempted (it may route to OpenAI instead, or
+            # surface its own clear error) rather than crashing here.
+            model_manager.safe_load("qwen", load_qwen)
         try:
-            summary, provider, face_result, structured = generate_event_summary(
-                smart_frames, ev_id, participants=participants_payload
+            summary, provider, face_result, structured = model_manager.run_stage(
+                "summary_generation",
+                generate_event_summary,
+                smart_frames, ev_id, participants=participants_payload,
+                fallback=lambda: (
+                    "AI summary unavailable for this event (summary "
+                    "generation failed — see logs).",
+                    "unavailable", None, None,
+                ),
             )
             header = f"{provider.upper()} SCENE SUMMARY" + (
                 f" (person: {face_result['name']}, {face_result['confidence']:.1f}%)"
@@ -945,12 +1007,18 @@ class EventManager:
 
             if provider == "openai" and structured:
                 persons_attrs = _persons_attrs_from_structured(structured)
+            elif provider == "unavailable":
+                persons_attrs = []
             else:
-                persons_attrs = extract_person_attributes(summary)
+                persons_attrs = model_manager.run_stage(
+                    "attribute_extraction", extract_person_attributes, summary,
+                    fallback=[],
+                )
         finally:
             # Always release Qwen, even if summarisation/extraction
             # raised, and even if it was only speculatively loaded.
-            unload_qwen()
+            if qwen_may_run:
+                model_manager.safe_unload("qwen", unload_qwen)
 
         # Apply extracted attributes onto every participant record —
         # index-aligned where possible, falling back to the first
@@ -1037,6 +1105,17 @@ class EventManager:
             telegram_status=telegram_status,
             total_seconds=time.time() - ev_end,
         )
+
+        # ISSUE 2 — one-line-per-model status summary for this event
+        # (LOADED / FAILED + reason for every model that was touched:
+        # videomae, qwen, face_recognition, summary_generation, ...),
+        # printed to stdout AND persisted into this event's
+        # processing_log.txt for later debugging.
+        model_manager.log_report(ev_id)
+        debug.log("[INFO]\nFinal model status:\n" + model_manager.report())
+        debug.log(f"[INFO]\nEvent {ev_id} finished. Summary: {'OK' if summary else 'UNAVAILABLE'}, "
+                   f"DB: {'OK' if db_ok else 'FAILED'}, Telegram: {telegram_status}.")
+        debug.flush_log()
 
         # (no reset_event_state() equivalent needed — this job dict and
         # its SceneEvent are already discarded; there is no shared
