@@ -208,8 +208,6 @@ This is the workflow I recommend for your project. Most days you'll only need a 
 
 
 
-Super da. Appo CPU-ku separate compose maintain panrathu than best practice. 👍
-
 Assuming file name:
 
 docker-compose.cpu.yml

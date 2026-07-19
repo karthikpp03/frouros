@@ -14,7 +14,7 @@ services:
     environment:
       HOME: /home/appuser
       TRITON_CACHE_DIR: /tmp/triton
-      XDG_CACHE_HOME: /home/appuser/.cache
+      XDG_CACHE_HOME: /home/appuser/.cache    
       HF_HOME: /home/appuser/.cache/huggingface
       TORCH_HOME: /home/appuser/.cache/torch
       MPLCONFIGDIR: /home/appuser/.config/matplotlib
